@@ -1,0 +1,18 @@
+name: Get Azure DevOps profile id
+on: workflow_dispatch
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  whoami:
+    runs-on: ubuntu-latest
+    environment: marketplace
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - run: |
+          az rest -u https://app.vssps.visualstudio.com/_apis/profile/profiles/me \
+            --resource 499b84ac-1321-427f-aa17-267ca6975798
