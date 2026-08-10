@@ -10,12 +10,17 @@
   GitHub Copilot gives you for its own edits.
 </p>
 
-<p align="center">
-  <a href="https://marketplace.visualstudio.com/items?itemName=FedeFluork.claude-keep-undo"><img src="https://img.shields.io/visual-studio-marketplace/v/FedeFluork.claude-keep-undo?label=marketplace" alt="Marketplace"></a>
-  <a href="https://marketplace.visualstudio.com/items?itemName=FedeFluork.claude-keep-undo"><img src="https://img.shields.io/visual-studio-marketplace/i/FedeFluork.claude-keep-undo" alt="Installs"></a>
+<div align="center">
+  <a href="https://marketplace.visualstudio.com/items?itemName=FedeFluork.claude-keep-undo"><img src="https://badgen.net/vs-marketplace/v/FedeFluork.claude-keep-undo?label=marketplace&color=blue" alt="Marketplace"></a>
+  <a href="https://marketplace.visualstudio.com/items?itemName=FedeFluork.claude-keep-undo"><img src="https://badgen.net/vs-marketplace/i/FedeFluork.claude-keep-undo?label=installs&color=blue" alt="Installs"></a>
+  <a href="https://open-vsx.org/extension/FedeFluork/claude-keep-undo"><img src="https://img.shields.io/open-vsx/v/FedeFluork/claude-keep-undo?label=open%20vsx" alt="Open VSX"></a>
+</div>
+<div align="center">
   <a href="https://code.visualstudio.com/"><img src="https://img.shields.io/badge/VS%20Code-%5E1.90.0-blue" alt="VS Code"></a>
   <a href="https://github.com/FedeFluork/claude-keep-undo/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT"></a>
-</p>
+</div>
+
+<br/>
 
 > **Unofficial.** This is a community project. It is not affiliated with,
 > endorsed by, or sponsored by Anthropic. *Claude* and *Claude Code* are

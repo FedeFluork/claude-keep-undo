@@ -730,7 +730,7 @@
     "watch": "tsc -watch -p ./",
     "lint": "node scripts/check-encoding.mjs && eslint src --ext .ts && prettier --check \"src/**/*.ts\" \"*.json\"",
     "format": "prettier --write \"src/**/*.ts\"",
-    "test:unit": "npm run compile && node --test \"out/test/unit/*.test.js\"",
+    "test:unit": "npm run compile && node scripts/run-unit-tests.mjs",
     "test:integration": "npm run compile && vscode-test",
     "test": "npm run test:unit && npm run test:integration",
     "package": "npx @vscode/vsce package"
