@@ -56,6 +56,10 @@ baseline and file agree, the file leaves the review queue.
   editor's undo stack, and is confirmed by a notification with a **Restore**
   button. A change that moved since the button was drawn is refused, never
   applied to whatever now occupies that position.
+- **Files you can keep out of it.** A `.keepundoignore` in the project root, with
+  the syntax you already know from `.gitignore`. An ignored file is not detected,
+  not queued, and — because the rule is enforced inside the hook too — never read
+  or copied aside. That last part is the point for a `.env`.
 - **Zero-config, or exact.** It works from the session transcript alone; install
   the Claude Code hooks for precise real-time baselines and full coverage.
 - **Fully local, stable API only.** No network calls, no telemetry, no account,
@@ -131,7 +135,8 @@ reference, and each one is a constraint of VS Code's **stable** extension API:
 No network requests, no telemetry, nothing sent anywhere. The extension reads
 your workspace files and your local Claude Code session transcripts, and writes
 baselines and recovery snapshots into VS Code's per-workspace storage — outside
-your repository. All of it stays on your machine.
+your repository. All of it stays on your machine. Anything listed in
+[`.keepundoignore`](REFERENCE.md#ignoring-files) is not read at all.
 
 ## Development
 

@@ -5,6 +5,39 @@ All notable changes to **Keep / Undo for Claude Code** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0]
+
+### Added — files the extension leaves alone
+
+- **`.keepundoignore`.** A file in the workspace root, with the syntax of
+  `.gitignore`: directory patterns, anchoring, `**`, character classes and `!`
+  re-inclusion, with the last matching rule deciding and a parent exclusion that
+  cannot be undone from inside — git's own rule. Matching follows the platform,
+  case-insensitive everywhere but Linux.
+- **An ignored file is not detected at all**: no gutter bars, no queue entry, no
+  *not reviewable* row, and no copy of its content in the extension's storage.
+  The rules are enforced inside the Claude Code hook as well as in the extension,
+  so an excluded file is never read — by the time a baseline exists, a verbatim
+  copy is already on disk, which is too late to make that promise about a `.env`.
+  The hook loads the extension's own compiled matcher rather than reimplementing
+  it, so the two processes cannot disagree by a pattern.
+- Three more sources for the same rules, applied before the file and overridable
+  by it: built-in defaults (`.git/`, `node_modules/`), the repository's own
+  `.gitignore` when asked, and `claudeKeepUndo.ignore.patterns` for rules that
+  are yours rather than the project's.
+- Settings `claudeKeepUndo.ignore.useIgnoreFile`, `ignore.patterns`,
+  `ignore.useDefaults` and `ignore.useGitignore`, in a new *Ignored files* group
+  in the Settings editor and in the setup panel — which grows a list control and
+  a link that creates `.keepundoignore` from a commented template.
+- Command **Stop Reviewing This File**, on the changes view and Source Control
+  context menus. Excluding a file that has changes waiting *keeps* them — the
+  recorded original is deleted with the queue entry — so the command names the
+  files and the number of changes and asks first. A rule that arrives some other
+  way (a hand edit, a colleague's commit, a settings change) reaches the same
+  outcome through a notification instead of a dialog.
+- Command **Edit Ignored Files (.keepundoignore)**, on the changes view menu, the
+  setup panel and the palette.
+
 ## [1.0.0]
 
 First public release.

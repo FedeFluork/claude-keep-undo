@@ -18,6 +18,8 @@ export interface PanelStatus {
   pendingFiles: number;
   pendingChanges: number;
   unreviewable: number;
+  /** Patterns in force across every enabled ignore source. */
+  ignoreRules: number;
 }
 
 type Scope = "user" | "workspace";
@@ -187,6 +189,7 @@ export class SettingsPanel {
           "claudeKeepUndo.openAllChanges",
           "claudeKeepUndo.revealSnapshots",
           "claudeKeepUndo.openWalkthrough",
+          "claudeKeepUndo.editIgnoreFile",
           "claudeKeepUndo.refresh",
         ]);
         if (typeof msg.command === "string" && allowed.has(msg.command)) {
@@ -287,11 +290,22 @@ function control(spec: SettingSpec): string {
       <input type="checkbox" data-key="${esc(spec.key)}">
       <span>Enabled</span>
     </label>`;
+  } else if (spec.type === "list") {
+    // One pattern per line, written back on blur rather than on every
+    // keystroke: each write goes to settings.json and reloads the rules.
+    body = `<textarea class="list" rows="4" spellcheck="false" data-key="${esc(
+      spec.key
+    )}" placeholder="one pattern per line, e.g. dist/"></textarea>`;
   } else {
     body = `<input class="text" type="text" data-key="${esc(
       spec.key
     )}" maxlength="${spec.maxLength ?? 32}">`;
   }
+  const action = spec.action
+    ? `<p class="actions"><button class="link" data-run="${esc(
+        spec.action.command
+      )}">${esc(spec.action.label)}</button></p>`
+    : "";
   return `<div class="setting" data-setting="${esc(spec.key)}">
     <div class="setting-head">
       <h3>${esc(spec.title)}</h3>
@@ -299,10 +313,15 @@ function control(spec: SettingSpec): string {
     </div>
     <p class="detail">${esc(spec.detail)}</p>
     ${body}
+    ${action}
     ${spec.note ? `<p class="note">${esc(spec.note)}</p>` : ""}
     <p class="key"><code>${SECTION}.${esc(spec.key)}</code></p>
   </div>`;
 }
+
+/** Bounds on a list setting, so a paste into the textarea cannot run away. */
+const LIST_MAX_ENTRIES = 500;
+const LIST_MAX_LENGTH = 500;
 
 function isValid(spec: SettingSpec, value: unknown): boolean {
   if (spec.type === "boolean") {
@@ -310,6 +329,15 @@ function isValid(spec: SettingSpec, value: unknown): boolean {
   }
   if (spec.type === "string") {
     return typeof value === "string" && value.length <= (spec.maxLength ?? 32);
+  }
+  if (spec.type === "list") {
+    return (
+      Array.isArray(value) &&
+      value.length <= LIST_MAX_ENTRIES &&
+      value.every(
+        (entry) => typeof entry === "string" && entry.length <= LIST_MAX_LENGTH
+      )
+    );
   }
   return (
     typeof value === "string" &&
@@ -408,6 +436,15 @@ section { margin-bottom: 34px; }
   background: var(--vscode-input-background);
   border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
 }
+.list {
+  display: block; width: 100%; padding: 6px 8px; border-radius: 3px;
+  font-family: var(--vscode-editor-font-family); font-size: 0.92em;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+  resize: vertical;
+}
+.actions { margin: 10px 0 0; }
 .note {
   margin: 10px 0 0; padding-left: 10px; font-size: 0.88em;
   border-left: 2px solid var(--vscode-panel-border);
@@ -438,6 +475,11 @@ document.addEventListener('change', (event) => {
     vscode.postMessage({ type: 'set', key, value: el.checked });
   } else if (el.type === 'radio') {
     vscode.postMessage({ type: 'set', key, value: el.value });
+  } else if (el.tagName === 'TEXTAREA') {
+    // Blank lines are dropped rather than stored: they mean nothing to the
+    // matcher and would accumulate in settings.json on every edit.
+    const lines = el.value.split('\\n').map((line) => line.trim()).filter(Boolean);
+    vscode.postMessage({ type: 'set', key, value: lines });
   } else {
     vscode.postMessage({ type: 'set', key, value: el.value });
   }
@@ -476,7 +518,11 @@ window.addEventListener('message', (event) => {
     for (const input of document.querySelectorAll('[data-key="' + key + '"]')) {
       if (input.type === 'checkbox') { input.checked = info.value === true; }
       else if (input.type === 'radio') { input.checked = input.value === info.value; }
-      else if (document.activeElement !== input) { input.value = info.value; }
+      else if (document.activeElement === input) { continue; }
+      else if (input.tagName === 'TEXTAREA') {
+        input.value = Array.isArray(info.value) ? info.value.join('\\n') : '';
+      }
+      else { input.value = info.value; }
     }
     const label = document.querySelector('[data-source-for="' + key + '"]');
     if (label) {
@@ -527,6 +573,14 @@ function renderStatus(status) {
   );
   if (status.unreviewable > 0) {
     host.appendChild(chip('warn', status.unreviewable + ' not reviewable'));
+  }
+  if (status.ignoreRules > 0) {
+    host.appendChild(chip(
+      '',
+      status.ignoreRules + (status.ignoreRules === 1 ? ' ignore rule' : ' ignore rules'),
+      'claudeKeepUndo.editIgnoreFile',
+      'Edit'
+    ));
   }
 }
 

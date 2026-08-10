@@ -22,7 +22,9 @@
  */
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 /**
  * How long a staged pre-edit copy stays valid. A Pre hook whose Post never ran
@@ -169,6 +171,93 @@ function readSidecar(contentPath) {
   }
 }
 
+/**
+ * The compiled ignore matcher, loaded from the extension's own build output.
+ *
+ * Shared rather than reimplemented: this decides whether a file is copied into
+ * the state directory at all, and a hook that disagreed with the extension by
+ * one pattern would either hide a file from review or take a copy of one the
+ * user excluded. `createRequire` is what lets this ESM script load the CommonJS
+ * that `tsc` emits, and both files ship in the same .vsix, so the path between
+ * them cannot go stale.
+ */
+function loadIgnoreModule() {
+  try {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    return createRequire(import.meta.url)(
+      path.join(here, "..", "out", "ignore.js")
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Compile the rules the extension published in `<stateDir>/ignore.json`, plus
+ * every file that descriptor points at.
+ *
+ * File-backed sources are read here rather than travelling inside the
+ * descriptor: `.keepundoignore` edited while VS Code was closed is then still in
+ * force the next time Claude runs. A missing descriptor — an install that
+ * predates it, or a workspace VS Code has never opened — falls back to the file
+ * alone, which is the source the user can see.
+ */
+function loadIgnoreRules(stateDir, fallbackRoot) {
+  const module = loadIgnoreModule();
+  if (!module) {
+    return { status: "unavailable" };
+  }
+  let descriptor;
+  try {
+    descriptor = JSON.parse(
+      fs.readFileSync(path.join(stateDir, "ignore.json"), "utf8")
+    );
+  } catch {
+    descriptor = undefined;
+  }
+  const root = descriptor?.root || fallbackRoot;
+  if (!root) {
+    // Nothing to make the paths relative to, so nothing can be matched.
+    return { status: "none" };
+  }
+  const specs = Array.isArray(descriptor?.sources)
+    ? descriptor.sources
+    : [
+        { label: "built-in defaults", patterns: module.DEFAULT_IGNORE_PATTERNS },
+        { label: ".keepundoignore", file: ".keepundoignore" },
+      ];
+  const sources = [];
+  for (const spec of specs) {
+    if (!spec || typeof spec !== "object") {
+      continue;
+    }
+    if (Array.isArray(spec.patterns)) {
+      sources.push({ label: String(spec.label ?? ""), patterns: spec.patterns });
+      continue;
+    }
+    if (typeof spec.file !== "string") {
+      continue;
+    }
+    let text;
+    try {
+      text = fs.readFileSync(path.join(root, spec.file), "utf8");
+    } catch {
+      continue; // the file simply is not there
+    }
+    sources.push({
+      label: String(spec.label ?? spec.file),
+      patterns: module.parseIgnoreFile(text),
+    });
+  }
+  const rules = module.compileIgnore(sources, {
+    caseSensitive:
+      typeof descriptor?.caseSensitive === "boolean"
+        ? descriptor.caseSensitive
+        : process.platform === "linux",
+  });
+  return rules.isEmpty ? { status: "none" } : { status: "ok", root, rules };
+}
+
 function remove(target) {
   try {
     fs.rmSync(target, { force: true });
@@ -243,6 +332,38 @@ async function main() {
   const pendingFile = path.join(stateDir, "pending", key);
   const eventsPath = path.join(stateDir, "events.ndjson");
 
+  /** One diagnostic line, with an optional reason for having done nothing. */
+  const record = (skipped) =>
+    appendEvent(
+      eventsPath,
+      JSON.stringify({
+        phase: mode,
+        path: filePath,
+        tool: payload.tool_name || "",
+        ts: Date.now(),
+        ...(skipped ? { skipped } : {}),
+      }) + "\n"
+    );
+
+  // Files the user excluded are not read, not staged and not promoted. This is
+  // the only place that can make that promise: by the time the extension sees a
+  // baseline, a verbatim copy of the file is already sitting on disk.
+  //
+  // A matcher that cannot be loaded leaves the capture running rather than
+  // stopping detection dead — the extension applies the same rules again and
+  // sweeps what it finds — but the event log says so, because taking copies of
+  // an excluded file is not something to discover by accident.
+  const ignore = loadIgnoreRules(stateDir, root);
+  if (ignore.status === "unavailable") {
+    record("ignore rules unavailable");
+  } else if (
+    ignore.status === "ok" &&
+    ignore.rules.ignores(ignore.root, filePath)
+  ) {
+    record("ignored");
+    return;
+  }
+
   if (mode === "pre") {
     // PRE runs *before* the edit is written. Capturing the original here is
     // correct, but we must NOT expose it as a baseline yet: at this instant the
@@ -266,16 +387,7 @@ async function main() {
             // the user's file where a baseline belongs. Log the refusal rather
             // than returning silently, so the diagnostic log distinguishes
             // "deliberately skipped" from "the hook never ran".
-            appendEvent(
-              eventsPath,
-              JSON.stringify({
-                phase: mode,
-                path: filePath,
-                tool: payload.tool_name || "",
-                ts: Date.now(),
-                skipped: "not utf-8",
-              }) + "\n"
-            );
+            record("not utf-8");
             return;
           }
           original = buf.toString("utf8");
@@ -345,15 +457,7 @@ async function main() {
     }
   }
 
-  appendEvent(
-    eventsPath,
-    JSON.stringify({
-      phase: mode,
-      path: filePath,
-      tool: payload.tool_name || "",
-      ts: Date.now(),
-    }) + "\n"
-  );
+  record();
 }
 
 main()

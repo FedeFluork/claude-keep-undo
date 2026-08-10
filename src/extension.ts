@@ -12,6 +12,7 @@ import {
 import { HookState } from "./detection/hookSettings";
 import { KeepUndoWatcher } from "./detection/keepUndoWatcher";
 import { TranscriptWatcher } from "./detection/transcriptWatcher";
+import { IGNORE_FILE_NAME, IgnoreConfig } from "./ignoreConfig";
 import * as settings from "./settings";
 import { ChangeNode, ChangesView, ChangesViewProvider } from "./ui/changesView";
 import { ClaudeCodeActionProvider } from "./ui/codeActions";
@@ -77,7 +78,11 @@ export function activate(
   const stateDir = resolveStateDir(context, workspaceRoot);
   ensureDir(stateDir);
   log(`Review state: ${stateDir}`);
-  const store = new ChangeStore(stateDir, workspaceRoot, log);
+  // Built before the store, which consults it on every path it is handed, and
+  // before the detectors, which must not read a file it excludes.
+  const ignoreConfig = new IgnoreConfig(workspaceRoot, stateDir, log);
+  context.subscriptions.push(ignoreConfig);
+  const store = new ChangeStore(stateDir, workspaceRoot, log, ignoreConfig);
   context.subscriptions.push(store);
 
   // --- providers -----------------------------------------------------------
@@ -141,6 +146,13 @@ export function activate(
       onOpening: () => diffLayout.notifyOpening(),
       siblings: store.getTracked().map((f) => f.path),
     });
+
+  /**
+   * True while an ignore rule is being added through the command, which
+   * confirms its own consequences. The reconcile that follows then reports
+   * nothing: two messages about one deliberate action read as a warning.
+   */
+  let confirmedIgnoreChange = false;
 
   // --- commands ------------------------------------------------------------
   const report = (result: ApplyResult, action: string) => {
@@ -416,6 +428,29 @@ export function activate(
       store.refreshFromDisk();
       refreshHookContext();
     }),
+    vscode.commands.registerCommand("claudeKeepUndo.editIgnoreFile", () =>
+      ignoreConfig.openIgnoreFile()
+    ),
+    vscode.commands.registerCommand(
+      "claudeKeepUndo.ignorePath",
+      async (arg?: unknown) => {
+        const p = resolvePath(arg);
+        if (!p) {
+          void vscode.window.showInformationMessage(
+            `Open a file, or right-click one in the Claude changes view, to add it to ${IGNORE_FILE_NAME}.`
+          );
+          return;
+        }
+        // Suppresses the notification the reconcile would otherwise raise: the
+        // modal below has already said, in more detail, what this does.
+        confirmedIgnoreChange = true;
+        try {
+          await addIgnoreRule(store, ignoreConfig, p);
+        } finally {
+          confirmedIgnoreChange = false;
+        }
+      }
+    ),
     vscode.commands.registerCommand("claudeKeepUndo.revealSnapshots", () => {
       // The directory is created lazily by the first snapshot, so before any
       // Undo this command used to reveal a path that does not exist — which on
@@ -538,6 +573,7 @@ export function activate(
       .getTracked()
       .reduce((total, file) => total + file.hunks.length, 0),
     unreviewable: store.getUnreviewable().length,
+    ignoreRules: ignoreConfig.patternCount(),
   });
 
   const refreshHookContext = () => {
@@ -573,6 +609,31 @@ export function activate(
     );
 
   context.subscriptions.push(
+    // A rule can start matching files that are already in the queue — the user
+    // edited `.keepundoignore` by hand, pulled a colleague's, or changed a
+    // setting. Those files leave the queue and their recorded originals are
+    // deleted, so the change is announced rather than simply happening.
+    ignoreConfig.onDidChange(() => {
+      const left = store.reconcileIgnored();
+      statusChanged.fire();
+      if (left.length === 0 || confirmedIgnoreChange) {
+        return;
+      }
+      void vscode.window
+        .showInformationMessage(
+          `${pluralFiles(left.length)} left the review queue: ${
+            left.length === 1 ? "it now matches" : "they now match"
+          } your ignore rules, so Claude's changes there were kept.`,
+          "Show Rules"
+        )
+        .then((choice) => {
+          if (choice === "Show Rules") {
+            void vscode.commands.executeCommand(
+              "claudeKeepUndo.editIgnoreFile"
+            );
+          }
+        });
+    }),
     vscode.window.onDidChangeActiveTextEditor(updateActiveContext),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("claudeKeepUndo.explorerContextMenu")) {
@@ -758,6 +819,96 @@ function explainNoHunk(ref: "baseline-side" | undefined): string {
   return ref === "baseline-side"
     ? "Keep and Undo act on the right-hand side of the diff — the file itself. Use the line numbers there."
     : "No Claude change on this line.";
+}
+
+// --- ignore rules ----------------------------------------------------------
+
+/**
+ * Add a rule for one path to `.keepundoignore`, confirming first when it would
+ * take files out of the review queue.
+ *
+ * That confirmation is the whole reason this is not a one-liner. Excluding a
+ * file with changes waiting deletes its recorded original, which is what makes
+ * those changes permanent — the same outcome as Keep, reached from a menu item
+ * that does not say so.
+ */
+async function addIgnoreRule(
+  store: ChangeStore,
+  ignore: IgnoreConfig,
+  absPath: string
+): Promise<void> {
+  const name = shortName(absPath);
+  const directory = await isDirectory(absPath);
+  // Asked with the directory flag, so a folder already covered by a rule such as
+  // `build/` is recognised as covered. Naming the rule and its source matters
+  // with four of them in play: "already excluded" alone starts a search.
+  const existing = ignore.match(absPath, directory);
+  if (existing) {
+    void vscode.window.showInformationMessage(
+      `${name} is already excluded from review by \`${existing.pattern}\` (${existing.source}).`
+    );
+    return;
+  }
+  const pattern = ignore.patternFor(absPath, directory);
+  if (!pattern) {
+    void vscode.window.showInformationMessage(
+      `${name} is outside the workspace folder, so a rule in ${IGNORE_FILE_NAME} would never match it.`
+    );
+    return;
+  }
+
+  const pending = ignore.matching(
+    pattern,
+    store.getTracked().map((f) => f.path)
+  );
+  if (pending.length > 0) {
+    const changes = pending.reduce(
+      (total, p) => total + (store.get(p)?.hunks.length ?? 0),
+      0
+    );
+    const waiting =
+      pending.length === 1
+        ? `${shortName(pending[0])} is waiting for review, with ${pluralChanges(changes)}.`
+        : `${pluralFiles(pending.length)} are waiting for review, with ${pluralChanges(
+            changes
+          )} between them.`;
+    const choice = await vscode.window.showWarningMessage(
+      `Stop reviewing ${directory ? `everything in ${name}` : name}?`,
+      {
+        modal: true,
+        detail:
+          `${waiting} Those changes will be kept, and the recorded originals ` +
+          "deleted — after this they can no longer be undone.\n\n" +
+          `The rule \`${pattern}\` is added to ${IGNORE_FILE_NAME}, where you can remove it again.`,
+      },
+      "Add Rule"
+    );
+    if (choice === undefined) {
+      return;
+    }
+  }
+
+  if (!(await ignore.addPattern(pattern))) {
+    void vscode.window.showErrorMessage(
+      `Could not write ${IGNORE_FILE_NAME}. See the Claude Keep/Undo output channel.`
+    );
+    return;
+  }
+  void vscode.window.showInformationMessage(
+    `Added \`${pattern}\` to ${IGNORE_FILE_NAME}. Claude's changes there are no longer detected.`
+  );
+}
+
+/** Whether a path is a directory, as far as the workspace filesystem knows. */
+async function isDirectory(absPath: string): Promise<boolean> {
+  try {
+    const stat = await vscode.workspace.fs.stat(vscode.Uri.file(absPath));
+    return (stat.type & vscode.FileType.Directory) !== 0;
+  } catch {
+    // Gone, or unreadable. A file is the safer guess: a rule with a trailing
+    // slash that turns out to name a file matches nothing at all.
+    return false;
+  }
 }
 
 // --- destructive-action confirmation ---------------------------------------

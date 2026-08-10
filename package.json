@@ -1,7 +1,7 @@
 {
   "name": "claude-keep-undo",
   "displayName": "Keep / Undo for Claude Code",
-  "description": "Review every change Claude Code makes to your files and Keep or Undo them hunk by hunk, Copilot-style. Unofficial — not affiliated with Anthropic.",
+  "description": "Review every change Claude Code makes to your files and Keep or Undo them hunk by hunk, Copilot-style.",
   "version": "1.0.0",
   "publisher": "FedeFluork",
   "author": {
@@ -292,6 +292,39 @@
             "description": "Also review Claude's edits to files outside the open folder (its own settings, scratch files, sibling repositories). Off by default: those files cannot be shown in the Explorer, and their baselines would be copied into this workspace's storage."
           }
         }
+      },
+      {
+        "title": "Ignored files",
+        "order": 5,
+        "properties": {
+          "claudeKeepUndo.ignore.useIgnoreFile": {
+            "type": "boolean",
+            "order": 1,
+            "default": true,
+            "description": "Read `.keepundoignore` from the workspace root. Same syntax as .gitignore; files it matches are never detected, never queued for review, and never copied into the extension's storage."
+          },
+          "claudeKeepUndo.ignore.patterns": {
+            "type": "array",
+            "order": 2,
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "description": "Extra .gitignore-style patterns, kept in your settings rather than in the project. Applied before `.keepundoignore`, so a rule in that file has the final word."
+          },
+          "claudeKeepUndo.ignore.useDefaults": {
+            "type": "boolean",
+            "order": 3,
+            "default": true,
+            "description": "Ignore `.git/` and `node_modules/`, which are never reviewed line by line."
+          },
+          "claudeKeepUndo.ignore.useGitignore": {
+            "type": "boolean",
+            "order": 4,
+            "default": false,
+            "description": "Also apply the rules in the repository's own `.gitignore` and `.git/info/exclude`. Only the files at the repository root are read: a per-directory .gitignore carries rules relative to its own directory."
+          }
+        }
       }
     ],
     "colors": [
@@ -432,6 +465,18 @@
         "command": "claudeKeepUndo.revealSnapshots",
         "title": "Reveal Recovery Snapshots",
         "category": "Claude Keep/Undo"
+      },
+      {
+        "command": "claudeKeepUndo.editIgnoreFile",
+        "title": "Edit Ignored Files (.keepundoignore)",
+        "category": "Claude Keep/Undo",
+        "icon": "$(exclude)"
+      },
+      {
+        "command": "claudeKeepUndo.ignorePath",
+        "title": "Stop Reviewing This File",
+        "category": "Claude Keep/Undo",
+        "icon": "$(exclude)"
       }
     ],
     "keybindings": [
@@ -632,6 +677,11 @@
           "command": "claudeKeepUndo.openDiff",
           "when": "scmProvider == claudeKeepUndo",
           "group": "navigation@1"
+        },
+        {
+          "command": "claudeKeepUndo.ignorePath",
+          "when": "scmProvider == claudeKeepUndo",
+          "group": "9_ignore@1"
         }
       ],
       "view/title": [
@@ -671,6 +721,11 @@
           "group": "1_recovery@2"
         },
         {
+          "command": "claudeKeepUndo.editIgnoreFile",
+          "when": "view == claudeKeepUndo.changes",
+          "group": "2_config@1"
+        },
+        {
           "command": "claudeKeepUndo.openWalkthrough",
           "when": "view == claudeKeepUndo.changes",
           "group": "9_help@1"
@@ -701,6 +756,16 @@
           "command": "claudeKeepUndo.installHooks",
           "when": "view == claudeKeepUndo.changes && viewItem == claudeUnreviewable",
           "group": "inline@1"
+        },
+        {
+          "command": "claudeKeepUndo.ignorePath",
+          "when": "view == claudeKeepUndo.changes && viewItem == claudeChange",
+          "group": "9_ignore@1"
+        },
+        {
+          "command": "claudeKeepUndo.ignorePath",
+          "when": "view == claudeKeepUndo.changes && viewItem == claudeUnreviewable",
+          "group": "9_ignore@1"
         }
       ],
       "editor/title": [

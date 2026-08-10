@@ -75,6 +75,20 @@ export interface Unreviewable {
 }
 
 /**
+ * The "leave this file alone entirely" rule, supplied by {@link IgnoreConfig}.
+ *
+ * An interface rather than the class itself so the store keeps no dependency on
+ * the settings, the ignore file or the watcher behind them — and so a test can
+ * hand it a predicate.
+ */
+export interface IgnorePredicate {
+  isIgnored(absPath: string): boolean;
+}
+
+/** Reviews nothing is ignored: the behaviour before this setting existed. */
+const IGNORE_NOTHING: IgnorePredicate = { isIgnored: () => false };
+
+/**
  * Outcome of a Keep/Undo action, so the UI can explain a refusal.
  *
  * `applied-modified` is a *success*: the file was written, but saving it ran the
@@ -213,7 +227,8 @@ export class ChangeStore implements vscode.Disposable {
   constructor(
     private readonly stateDir: string,
     private readonly workspaceRoot: string,
-    private readonly log: (msg: string) => void
+    private readonly log: (msg: string) => void,
+    private readonly ignore: IgnorePredicate = IGNORE_NOTHING
   ) {
     this.normalizedRoot = normalizePath(workspaceRoot);
     this.readScopeSetting();
@@ -261,6 +276,23 @@ export class ChangeStore implements vscode.Disposable {
     // `startsWith("..")` also matches a directory genuinely named `..cache`,
     // which would then be silently excluded from review.
     return rel !== ".." && !rel.startsWith(`..${path.sep}`);
+  }
+
+  /**
+   * Has the user asked for this file to be left alone?
+   *
+   * Deliberately a separate question from {@link isInScope}, even though the two
+   * are consulted together everywhere. Being outside the workspace is a fact
+   * about the path; being ignored is an instruction, it can be withdrawn, and
+   * the two want different words in the log when a baseline is dropped.
+   */
+  isIgnored(absPath: string): boolean {
+    return this.ignore.isIgnored(absPath);
+  }
+
+  /** Both questions at once, for the callers that only need a yes or no. */
+  private shouldTrack(absPath: string): boolean {
+    return this.isInScope(absPath) && !this.isIgnored(absPath);
   }
 
   private fire(uri: vscode.Uri | undefined): void {
@@ -332,6 +364,11 @@ export class ChangeStore implements vscode.Disposable {
   }
 
   noteUnreviewable(absPath: string, reason: string): void {
+    if (this.isIgnored(absPath)) {
+      // "Not reviewable" is still a row in the changes view naming the file, and
+      // someone who excluded it asked not to be told about it at all.
+      return;
+    }
     if (this.unreviewable.get(absPath) === reason) {
       return;
     }
@@ -566,6 +603,15 @@ export class ChangeStore implements vscode.Disposable {
         // Dropping it is what the setting asked for, and a new baseline is
         // captured from scratch if it is ever turned back on.
         this.log(`dropping out-of-workspace baseline for ${sidecar.path}`);
+        removeFile(contentPath);
+        removeFile(sidecarPath(contentPath));
+        continue;
+      }
+      if (this.isIgnored(sidecar.path)) {
+        // A rule was added after this baseline was captured, or the hook ran
+        // with rules older than the ones in force now. Either way the file is
+        // one the user asked not to have copied aside, so the copy goes.
+        this.log(`dropping ignored baseline for ${sidecar.path}`);
         removeFile(contentPath);
         removeFile(sidecarPath(contentPath));
         continue;
@@ -900,6 +946,13 @@ export class ChangeStore implements vscode.Disposable {
       this.log(`ignoring ${absPath}: outside the workspace folder`);
       return;
     }
+    if (this.isIgnored(absPath)) {
+      // The last line of defence, not the first: the hook and the transcript
+      // reader both check before they read the file, so reaching this point
+      // means the content is already in memory. It goes no further than that.
+      this.log(`ignoring ${absPath}: excluded from review`);
+      return;
+    }
     if (fileExists(this.baselinePath(absPath))) {
       this.recompute(absPath);
       return;
@@ -930,6 +983,10 @@ export class ChangeStore implements vscode.Disposable {
 
   /** Re-read every known baseline from disk and recompute (used on load). */
   refreshFromDisk(): void {
+    // Before the baselines, because a staging is the one piece of state nothing
+    // else revisits: a Pre hook whose Post never ran leaves the file's content
+    // in `pending/` with no baseline and no entry pointing at it.
+    this.sweepPendingState();
     const seen = new Set<string>();
     for (const entry of this.baselinePaths()) {
       seen.add(entry.path);
@@ -963,12 +1020,11 @@ export class ChangeStore implements vscode.Disposable {
    * hundred full diffs per event, all on the extension host thread.
    */
   reloadBaseline(absPath: string): void {
-    if (!this.isInScope(absPath)) {
-      // The hook captured something we do not review. Drop it here as well as
-      // in the full sweep, or it sits in storage until the next one.
-      const baseline = this.baselinePath(absPath);
-      removeFile(baseline);
-      removeFile(sidecarPath(baseline));
+    if (!this.shouldTrack(absPath)) {
+      // The hook captured something we do not review — out of scope, or matched
+      // by an ignore rule it did not have yet. Drop it here as well as in the
+      // full sweep, or it sits in storage until the next one.
+      this.discardState(absPath);
       return;
     }
     // Dropping the entry is what makes `recompute` re-read the baseline — and
@@ -1025,8 +1081,10 @@ export class ChangeStore implements vscode.Disposable {
       }
       return;
     }
-    if (!this.isInScope(absPath)) {
-      // The setting was turned off while this file was being tracked.
+    if (!this.shouldTrack(absPath)) {
+      // The setting was turned off, or a rule started matching, while this file
+      // was being tracked. `reconcileIgnored` handles the state on disk; this is
+      // only the in-memory entry, which a stray recompute must not resurrect.
       if (this.tracked.delete(absPath)) {
         this.closeDiffTabs(absPath);
         if (!silent) {
@@ -1222,6 +1280,78 @@ export class ChangeStore implements vscode.Disposable {
     this.closeDiffTabs(absPath);
     if (!silent) {
       this.fire(vscode.Uri.file(absPath));
+    }
+  }
+
+  /**
+   * Forget a path we are not reviewing after all, and everything recorded about
+   * it. Same disk work as {@link resolve} — the pre-Claude content is a copy of
+   * a file the user asked us not to hold, so it does not survive as "recovery
+   * data" the way a demoted baseline does.
+   */
+  private discardState(absPath: string): void {
+    if (this.hasBaseline(absPath)) {
+      this.log(`discarding recorded state for ${absPath}: not under review`);
+    }
+    this.resolve(absPath, true);
+  }
+
+  /**
+   * Bring the queue and the state directory into line with the ignore rules,
+   * and report which files left the queue because of them.
+   *
+   * A file that becomes ignored while it has changes waiting is dropped, and its
+   * baseline with it — so those changes are, in effect, kept. That is the honest
+   * reading of "stop looking at this file", but it is not something to do
+   * silently: the returned paths are what the caller names in the notification,
+   * and the command that adds a rule confirms first.
+   *
+   * The reverse does not restore anything. Once the recorded original is gone
+   * there is nothing to review against; the next edit Claude makes to the file
+   * starts it over.
+   */
+  reconcileIgnored(): string[] {
+    const left = [...this.tracked.keys()].filter((p) => this.isIgnored(p));
+    for (const absPath of left) {
+      this.log(`${absPath} is now ignored: leaving the review queue`);
+      this.resolve(absPath, true);
+    }
+    for (const absPath of [...this.unreviewable.keys()]) {
+      if (this.isIgnored(absPath)) {
+        this.unreviewable.delete(absPath);
+      }
+    }
+    // Re-reads every baseline through the new rules — which is what drops the
+    // ones belonging to files that are now ignored — sweeps the stagings, and
+    // fires once at the end.
+    this.refreshFromDisk();
+    return left;
+  }
+
+  /**
+   * Drop pre-edit copies staged by the hook for files we are not reviewing.
+   *
+   * `baselinePaths()` sweeps `baselines/`, and `resolve()` clears the staging of
+   * one path. Neither reaches a staging whose Post hook never ran: that file has
+   * no baseline and no tracked entry, so nothing else would ever look at it
+   * again until the TTL, and until then it holds the verbatim content of a file
+   * the user excluded.
+   */
+  private sweepPendingState(): void {
+    const dir = pendingDir(this.stateDir);
+    for (const name of listDir(dir)) {
+      if (name.endsWith(".json") || name.endsWith(".tmp")) {
+        continue;
+      }
+      const contentPath = path.join(dir, name);
+      const sidecar = readSidecar(contentPath);
+      if (!sidecar || this.shouldTrack(sidecar.path)) {
+        continue;
+      }
+      this.markStateWrite();
+      this.log(`dropping the staged copy of ${sidecar.path}: not under review`);
+      removeFile(contentPath);
+      removeFile(sidecarPath(contentPath));
     }
   }
 

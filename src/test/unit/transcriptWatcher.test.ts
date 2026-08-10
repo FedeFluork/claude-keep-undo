@@ -56,6 +56,9 @@ class FakeStore {
   isInScope(): boolean {
     return true;
   }
+  isIgnored(): boolean {
+    return false;
+  }
   hasBaseline(p: string): boolean {
     return this.baselines.has(p);
   }

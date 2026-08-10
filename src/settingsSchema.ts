@@ -10,7 +10,7 @@
 
 export const SECTION = "claudeKeepUndo";
 
-export type SettingValue = string | boolean;
+export type SettingValue = string | boolean | string[];
 
 export interface SettingChoice {
   value: string;
@@ -27,13 +27,19 @@ export interface SettingSpec {
   title: string;
   /** The explanation the panel shows under the title. */
   detail: string;
-  type: "enum" | "boolean" | "string";
+  /** `list` is an array of strings, rendered as one entry per line. */
+  type: "enum" | "boolean" | "string" | "list";
   default: SettingValue;
   choices?: SettingChoice[];
   /** For `type: "string"`, the manifest's maxLength. */
   maxLength?: number;
   /** Shown in the panel when the value is the non-obvious one. */
   note?: string;
+  /**
+   * A command offered next to the control, for a setting whose real subject is
+   * a file rather than a value.
+   */
+  action?: { command: string; label: string };
 }
 
 export interface SettingGroup {
@@ -366,6 +372,51 @@ export const SETTING_GROUPS: SettingGroup[] = [
           "Claude routinely edits files outside your project — its own settings, scratch files, a sibling repository. Off by default: those files cannot be shown in the Explorer, and their baselines would be copied into this workspace's storage.",
         type: "boolean",
         default: false,
+      },
+    ],
+  },
+  {
+    id: "ignore",
+    title: "Ignored files",
+    blurb:
+      "Paths the extension leaves alone entirely. An ignored file is never detected, never queued and never copied into the extension's storage — which is the point for anything holding a secret, and the difference between this and simply hiding a row.",
+    settings: [
+      {
+        key: "ignore.useIgnoreFile",
+        title: "Read .keepundoignore",
+        detail:
+          "A file in the workspace root, with the same syntax as .gitignore: one pattern per line, a trailing '/' for a directory, '!' to re-include, and the last matching line wins. It is committed with the project, so the whole team gets the same rules.",
+        type: "boolean",
+        default: true,
+        action: {
+          command: "claudeKeepUndo.editIgnoreFile",
+          label: "Open .keepundoignore",
+        },
+      },
+      {
+        key: "ignore.patterns",
+        title: "Additional patterns",
+        detail:
+          "The same syntax, kept in your settings instead of in the project — for rules that are yours rather than the team's. One pattern per line. These are applied before .keepundoignore, so a rule in that file has the final word.",
+        type: "list",
+        default: [],
+      },
+      {
+        key: "ignore.useDefaults",
+        title: "Ignore .git and node_modules",
+        detail:
+          "The two directories that are never reviewed by hand: an `npm install` Claude runs for you would otherwise queue thousands of files, and a baseline of a git index is not text anyone reads.",
+        type: "boolean",
+        default: true,
+      },
+      {
+        key: "ignore.useGitignore",
+        title: "Also apply .gitignore",
+        detail:
+          "Adds the rules from the repository's own .gitignore and .git/info/exclude. Off by default because build output you do not commit is still output you may want to see Claude change.",
+        type: "boolean",
+        default: false,
+        note: "Only the .gitignore in the workspace root is read. Per-directory .gitignore files further down the tree carry rules relative to their own directory, and applying those from the root would exclude the wrong files.",
       },
     ],
   },

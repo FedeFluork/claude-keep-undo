@@ -15,6 +15,7 @@ extension.
 - [Undo is reversible](#undo-is-reversible)
 - [How change detection works](#how-change-detection-works)
 - [On-disk state](#on-disk-state)
+- [Ignoring files](#ignoring-files)
 - [Settings](#settings)
 - [Commands](#commands)
 - [Known limitations](#known-limitations)
@@ -250,6 +251,7 @@ State lives in **VS Code's per-workspace storage**, not in your repository:
 ├── pending/<key>          staging area between the Pre and Post hook
 ├── pending/<key>.json     { path, ts } — expires a staging left by a denied edit
 ├── snapshots/<key>-<ts>   pre-Undo copies, so a destructive action is recoverable
+├── ignore.json            the ignore rules, published for the hook process
 └── events.ndjson          size-capped log of hook events
 ```
 
@@ -264,6 +266,85 @@ committed. Run *Claude Keep/Undo: Reveal Recovery Snapshots* to find them.
 
 ---
 
+## Ignoring files
+
+Some files are not worth reviewing — generated output, a lockfile, a vendored
+tree — and some should not be copied aside at all, because they hold secrets.
+A `.keepundoignore` in the workspace root covers both.
+
+```gitignore
+# Same syntax as .gitignore, and the same precedence: last match wins.
+dist/
+*.log
+.env
+!.env.example
+```
+
+An ignored file is **not detected at all**. No gutter bars, no entry in the
+review queue, no *not reviewable* row — and, the part that matters for a `.env`,
+no copy of its content in the extension's storage. The rules are enforced in the
+Claude Code hook as well as in the extension, so the file is never read in the
+first place: by the time a baseline exists, a verbatim copy is already on disk,
+which is too late for a promise about secrets.
+
+### Where the rules come from
+
+Four sources, applied in this order. The last rule that matches a path decides
+it, so a later source can re-include with `!` what an earlier one excluded.
+
+| # | Source | Setting |
+|---|---|---|
+| 1 | `.git/` and `node_modules/` | `ignore.useDefaults` (on) |
+| 2 | `.gitignore` and `.git/info/exclude` | `ignore.useGitignore` (off) |
+| 3 | `claudeKeepUndo.ignore.patterns` | always applied |
+| 4 | `.keepundoignore` in the workspace root | `ignore.useIgnoreFile` (on) |
+
+The file goes last because it is the project's own statement — committed, shared
+with the team, and the first thing a reader of the repository will look at.
+`ignore.patterns` is for rules that are yours rather than the team's; it can be
+set per user or per workspace and travels with Settings Sync.
+
+Only the `.gitignore` at the repository root is read. A per-directory
+`.gitignore` further down the tree carries rules relative to *its* directory, and
+applying those from the root would exclude the wrong files.
+
+### Syntax
+
+The practical subset of gitignore, and nothing else — no regular expressions.
+
+| | |
+|---|---|
+| `build/` | a directory, at any depth |
+| `/build` | anchored at the workspace root |
+| `*.log`, `temp?.txt` | wildcards that do not cross a `/` |
+| `**` | crosses directories: leading (any depth), trailing (everything inside), or between two slashes |
+| `[abc]`, `[a-z]`, `[!a]` | character classes |
+| `!pattern` | re-includes — but not a file whose parent directory is excluded, exactly as in git |
+| `# comment` | and blank lines, ignored |
+| `\#`, `\!` | an escape, for a name that starts with one |
+
+Matching is case-insensitive on macOS and Windows and case-sensitive on Linux,
+which is the rule the rest of the extension applies to paths.
+
+### Adding a rule from the UI
+
+Right-click a file in *Claude: Changes to Review* (or in the Source Control
+list) and choose **Stop Reviewing This File**. It writes the anchored rule for
+that exact path into `.keepundoignore`, creating the file from a commented
+template if it does not exist.
+
+If the file has changes waiting, the command says so and asks first, because
+excluding it **keeps** them: the recorded original is deleted along with the
+queue entry, and after that they can no longer be undone. The same thing happens
+— with a notification rather than a dialog — when a rule you add by hand, or one
+that arrives from a colleague, starts matching a file already in the queue.
+
+Removing a rule does not bring anything back. There is nothing to review against
+once the recorded original is gone; the next edit Claude makes to the file starts
+it over.
+
+---
+
 ## Settings
 
 Every surface listed above is a setting, and there are two ways to reach them.
@@ -275,7 +356,8 @@ what is currently detected, offers three presets — **Minimal**, **Recommended*
 writes ordinary VS Code settings, so nothing there is private to the panel.
 
 **The Settings editor.** *Extensions › Keep / Undo for Claude Code*, grouped into
-*Review surfaces*, *Pending queue*, *Safety and feedback* and *Detection*.
+*Review surfaces*, *Pending queue*, *Safety and feedback*, *Detection* and
+*Ignored files*.
 
 ### Review surfaces
 
@@ -316,6 +398,17 @@ writes ordinary VS Code settings, so nothing there is private to the panel.
 | `claudeKeepUndo.promptToInstallHooks` | `true` | Offer to install the hooks on startup |
 | `claudeKeepUndo.trackOutsideWorkspace` | `false` | Also review files outside the open folder |
 
+### Ignored files
+
+See [Ignoring files](#ignoring-files) for the syntax and the precedence.
+
+| Setting | Default | Description |
+|---|---|---|
+| `claudeKeepUndo.ignore.useIgnoreFile` | `true` | Read `.keepundoignore` from the workspace root |
+| `claudeKeepUndo.ignore.patterns` | `[]` | Extra patterns, kept in your settings rather than in the project |
+| `claudeKeepUndo.ignore.useDefaults` | `true` | Ignore `.git/` and `node_modules/` |
+| `claudeKeepUndo.ignore.useGitignore` | `false` | Also apply the repository's own `.gitignore` |
+
 The badge color is themeable via `claudeKeepUndo.modifiedResourceForeground` in
 `workbench.colorCustomizations`.
 
@@ -339,6 +432,8 @@ All commands live under the **Claude Keep/Undo** category.
 | Install Claude Code Hooks in This Project | Palette, unreviewable rows | |
 | Refresh Change Status | Changes view toolbar, palette | |
 | Reveal Recovery Snapshots | Changes view menu, palette | |
+| Edit Ignored Files (.keepundoignore) | Changes view menu, settings panel, palette | |
+| Stop Reviewing This File | Changes view context menu, Source Control, palette | |
 
 *Undo All* asks for confirmation before rewriting files. On macOS the four
 keyboard shortcuts use `Cmd` instead of `Ctrl`, and all of them apply only while
@@ -485,6 +580,8 @@ npm run package     # npx @vscode/vsce package
 | `src/changeStore.ts` | State (baselines, pending hunks), recompute, keep/undo actions |
 | `src/diff.ts` | Dependency-free LCS line-diff engine, plus `LineChange` ↔ hunk mapping |
 | `src/util.ts` | Path hashing, project-dir encoding, safe file IO |
+| `src/ignore.ts` | Pure `.gitignore`-style matcher, shared with the hook process |
+| `src/ignoreConfig.ts` | Merges the ignore sources, watches them, publishes them for the hook |
 | `src/detection/hookInstaller.ts` | Install/repair hooks, with settings safety |
 | `src/detection/hookSettings.ts` | Pure hook-config merge and state classification |
 | `src/detection/keepUndoWatcher.ts` | Watches `<state>/baselines/**` (hook channel) |
@@ -515,3 +612,8 @@ anything anywhere. It reads your workspace files and your local Claude Code
 session transcripts, and writes baselines and recovery snapshots into VS
 Code's per-workspace storage — outside your repository, never inside it.
 All of it stays on your machine.
+
+A file matched by [an ignore rule](#ignoring-files) is not read at all: the rule
+is enforced inside the Claude Code hook, before the file is opened, as well as in
+the extension. Put `.env`, `*.pem` and anything else you would not want copied
+aside into `.keepundoignore`.

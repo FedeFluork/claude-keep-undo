@@ -821,4 +821,153 @@ describe("Keep / Undo for Claude Code", () => {
     );
     assert.equal(doc.getText(), "old\n");
   });
+
+  describe("ignored files", () => {
+    /** Poll until a condition holds, so a watcher's latency is not a flake. */
+    async function until(
+      what: string,
+      predicate: () => boolean,
+      timeout = 5_000
+    ): Promise<void> {
+      const deadline = Date.now() + timeout;
+      while (Date.now() < deadline) {
+        if (predicate()) {
+          return;
+        }
+        await wait(50);
+      }
+      assert.fail(`timed out waiting for ${what}`);
+    }
+
+    const ignoreFile = () => path.join(root, ".keepundoignore");
+
+    afterEach(async () => {
+      await configure("ignore.patterns", undefined);
+      fs.rmSync(ignoreFile(), { force: true });
+      await wait(200);
+    });
+
+    it("never registers a baseline for an ignored file", async () => {
+      await configure("ignore.patterns", ["it-secret.*"]);
+      await wait(200);
+      const file = makeFile("it-secret.env", "API_KEY=live\n");
+
+      api.store.registerBaseline(file, "API_KEY=old\n");
+
+      assert.equal(api.store.isTracked(file), false);
+      assert.equal(
+        fileExists(path.join(baselinesDir(stateDir), pathKey(file))),
+        false,
+        "the pre-Claude content of an excluded file must not reach the disk"
+      );
+    });
+
+    it("drops a baseline that a rule reaches after it was written", async () => {
+      // The hook may have captured the file before the rule existed, or with an
+      // older descriptor. The sweep is what makes the rule retroactive.
+      const file = makeFile("it-generated.ts", "export const a = 2;\n");
+      seedBaseline(file, "export const a = 1;\n");
+      await vscode.commands.executeCommand("claudeKeepUndo.refresh");
+      await until("the file to be under review", () =>
+        api.store.isTracked(file)
+      );
+
+      await configure("ignore.patterns", ["it-generated.ts"]);
+
+      await until(
+        "the file to leave the queue",
+        () => !api.store.isTracked(file)
+      );
+      assert.equal(
+        fileExists(path.join(baselinesDir(stateDir), pathKey(file))),
+        false,
+        "its recorded original must be deleted, not merely hidden"
+      );
+    });
+
+    it("reads .keepundoignore from the workspace root", async () => {
+      const file = makeFile("it-ignored-by-file.ts", "changed\n");
+      seedBaseline(file, "original\n");
+      await vscode.commands.executeCommand("claudeKeepUndo.refresh");
+      await until("the file to be under review", () =>
+        api.store.isTracked(file)
+      );
+
+      fs.writeFileSync(ignoreFile(), "it-ignored-by-file.ts\n");
+
+      await until(
+        "the ignore file to take effect",
+        () => !api.store.isTracked(file)
+      );
+    });
+
+    it("re-includes a file with a later ! rule", async () => {
+      fs.writeFileSync(ignoreFile(), "*.tmp.ts\n!it-keep.tmp.ts\n");
+      await wait(400);
+      const excluded = makeFile("it-drop.tmp.ts", "changed\n");
+      const included = makeFile("it-keep.tmp.ts", "changed\n");
+      seedBaseline(excluded, "original\n");
+      seedBaseline(included, "original\n");
+
+      await vscode.commands.executeCommand("claudeKeepUndo.refresh");
+      await until("the re-included file to be under review", () =>
+        api.store.isTracked(included)
+      );
+      assert.equal(api.store.isTracked(excluded), false);
+    });
+
+    it("does not list an ignored file as unreviewable either", async () => {
+      await configure("ignore.patterns", ["it-unreviewable.bin"]);
+      await wait(200);
+      const file = makeFile("it-unreviewable.bin", "x\n");
+
+      api.store.noteUnreviewable(file, "the file is not UTF-8 text");
+
+      assert.equal(
+        api.store.getUnreviewable().some((u) => u.path === file),
+        false,
+        "an excluded file must not come back as a row saying why it cannot be reviewed"
+      );
+    });
+
+    it("publishes the rules for the hook process", async () => {
+      await configure("ignore.patterns", ["it-hook-rule/"]);
+      await until("the descriptor to be rewritten", () => {
+        const raw = fs.existsSync(path.join(stateDir, "ignore.json"))
+          ? fs.readFileSync(path.join(stateDir, "ignore.json"), "utf8")
+          : "";
+        return raw.includes("it-hook-rule/");
+      });
+
+      const descriptor = JSON.parse(
+        fs.readFileSync(path.join(stateDir, "ignore.json"), "utf8")
+      ) as {
+        root: string;
+        sources: { label: string; patterns?: string[]; file?: string }[];
+      };
+      assert.equal(descriptor.root, root);
+      // The file-backed source travels as a path, so the hook reads it live and
+      // an edit made while VS Code was closed is still in force.
+      assert.ok(
+        descriptor.sources.some((s) => s.file === ".keepundoignore"),
+        "the descriptor must point the hook at the ignore file"
+      );
+      assert.ok(
+        descriptor.sources.some((s) => s.patterns?.includes("node_modules/")),
+        "the built-in defaults must reach the hook too"
+      );
+    });
+
+    it("ignores .git and node_modules out of the box", () => {
+      assert.equal(
+        api.store.isIgnored(path.join(root, "node_modules", "x", "index.js")),
+        true
+      );
+      assert.equal(api.store.isIgnored(path.join(root, ".git", "HEAD")), true);
+      assert.equal(
+        api.store.isIgnored(path.join(root, "src", "app.ts")),
+        false
+      );
+    });
+  });
 });

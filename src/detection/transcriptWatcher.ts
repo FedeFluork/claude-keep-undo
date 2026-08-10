@@ -479,7 +479,12 @@ export class TranscriptWatcher implements vscode.Disposable {
     // settings, a scratch file in /tmp, a sibling repository it was asked to
     // read. Tracking those would write verbatim copies of them into *this*
     // workspace's state and list them in a view that cannot show them.
-    if (!this.store.isInScope(filePath)) {
+    //
+    // The ignore rules are checked in the same breath, and it has to be here
+    // rather than at registration: a `write` reads the file a few lines below to
+    // capture what it is about to overwrite, so a `.env` excluded from review
+    // would otherwise be held in memory for the lifetime of the snapshot.
+    if (!this.store.isInScope(filePath) || this.store.isIgnored(filePath)) {
       return;
     }
 

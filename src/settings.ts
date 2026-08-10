@@ -29,6 +29,23 @@ function choice<T extends string>(key: string, allowed: readonly T[]): T {
     : fallback;
 }
 
+/**
+ * Read a list setting, keeping only the entries that are strings.
+ *
+ * `settings.json` is hand-edited and Settings Sync carries whatever is in it, so
+ * a number or a nested object in this array is a shape the compiler has already
+ * been told is impossible. Dropping the entries that are not strings is better
+ * than either throwing — this is read from the file watcher's callback — or
+ * handing a non-string to the pattern compiler.
+ */
+function list(key: string): string[] {
+  const value = vscode.workspace.getConfiguration(SECTION).get<unknown>(key);
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((entry): entry is string => typeof entry === "string");
+}
+
 export type InlineReview = "quickDiff" | "comments" | "both" | "off";
 export type CodeLensMode = "always" | "diffOnly" | "off";
 export type CodeLensStyle = "text" | "emoji";
@@ -136,6 +153,22 @@ export function promptToInstallHooks(): boolean {
 
 export function trackOutsideWorkspace(): boolean {
   return raw<boolean>("trackOutsideWorkspace");
+}
+
+export function useIgnoreFile(): boolean {
+  return raw<boolean>("ignore.useIgnoreFile");
+}
+
+export function ignorePatterns(): string[] {
+  return list("ignore.patterns");
+}
+
+export function useIgnoreDefaults(): boolean {
+  return raw<boolean>("ignore.useDefaults");
+}
+
+export function useGitignore(): boolean {
+  return raw<boolean>("ignore.useGitignore");
 }
 
 /** Write a setting, from the panel or from a preset. */

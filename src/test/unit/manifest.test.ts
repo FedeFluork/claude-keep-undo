@@ -295,6 +295,33 @@ describe("manifest: publishing metadata", () => {
     assert.equal(setting.default, false);
   });
 
+  it("declares the ignore settings the matcher and the hook read", () => {
+    const props = properties();
+    const patterns = props["claudeKeepUndo.ignore.patterns"] as {
+      type: string;
+      default: unknown;
+      items?: { type: string };
+    };
+    assert.ok(patterns, "claudeKeepUndo.ignore.patterns is not declared");
+    assert.equal(patterns.type, "array");
+    assert.deepEqual(patterns.default, []);
+    assert.equal(patterns.items?.type, "string");
+    for (const key of [
+      "claudeKeepUndo.ignore.useIgnoreFile",
+      "claudeKeepUndo.ignore.useDefaults",
+      "claudeKeepUndo.ignore.useGitignore",
+    ]) {
+      assert.equal((props[key] as { type: string })?.type, "boolean", key);
+    }
+    // Reading `.gitignore` changes which of the user's files are reviewed at
+    // all, so it is opt-in; the other two are the shipped behaviour.
+    assert.equal(
+      (props["claudeKeepUndo.ignore.useGitignore"] as { default: boolean })
+        .default,
+      false
+    );
+  });
+
   it("declares a settings default for every inline review mode", () => {
     const setting = properties()["claudeKeepUndo.inlineReview"] as {
       enum: string[];

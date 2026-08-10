@@ -28,6 +28,7 @@ interface Category {
       default: unknown;
       enum?: string[];
       maxLength?: number;
+      items?: { type: string };
     }
   >;
 }
@@ -64,7 +65,14 @@ describe("settings schema", () => {
     for (const spec of allSettings()) {
       const declaration = declared.get(`${SECTION}.${spec.key}`);
       assert.ok(declaration);
-      const expectedType = spec.type === "enum" ? "string" : spec.type;
+      // The panel's vocabulary is not the manifest's: an `enum` is a string
+      // constrained to a set, and a `list` is an array of them.
+      const expectedType =
+        spec.type === "enum"
+          ? "string"
+          : spec.type === "list"
+            ? "array"
+            : spec.type;
       assert.equal(declaration.type, expectedType, `${spec.key}: type`);
       assert.deepEqual(
         declaration.default,
@@ -96,6 +104,37 @@ describe("settings schema", () => {
       for (const choice of spec.choices ?? []) {
         assert.ok(choice.label.length > 0, `${spec.key}: unlabelled choice`);
         assert.ok(choice.detail.length > 0, `${spec.key}: undescribed choice`);
+      }
+    }
+  });
+
+  it("declares every list setting as an array of strings", () => {
+    // Without `items` the Settings editor offers no way to add an entry, and
+    // the panel would be the only place the setting could be edited at all.
+    for (const spec of allSettings()) {
+      if (spec.type !== "list") {
+        continue;
+      }
+      const declaration = declared.get(`${SECTION}.${spec.key}`);
+      assert.equal(declaration?.items?.type, "string", `${spec.key}: items`);
+      assert.ok(Array.isArray(spec.default), `${spec.key}: default`);
+    }
+  });
+
+  it("offers a command next to a setting only if that command exists", () => {
+    const commands = new Set(
+      (
+        JSON.parse(
+          fs.readFileSync(path.join(root, "package.json"), "utf8")
+        ) as { contributes: { commands: { command: string }[] } }
+      ).contributes.commands.map((c) => c.command)
+    );
+    for (const spec of allSettings()) {
+      if (spec.action) {
+        assert.ok(
+          commands.has(spec.action.command),
+          `${spec.key} offers ${spec.action.command}, which is not declared`
+        );
       }
     }
   });
