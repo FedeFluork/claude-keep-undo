@@ -1,0 +1,765 @@
+{
+  "name": "claude-keep-undo",
+  "displayName": "Keep / Undo for Claude Code",
+  "description": "Review every change Claude Code makes to your files and Keep or Undo them hunk by hunk, Copilot-style. Unofficial — not affiliated with Anthropic.",
+  "version": "1.0.0",
+  "publisher": "FedeFluork",
+  "author": {
+    "name": "FedeFluork"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FedeFluork/claude-keep-undo.git"
+  },
+  "bugs": {
+    "url": "https://github.com/FedeFluork/claude-keep-undo/issues"
+  },
+  "homepage": "https://github.com/FedeFluork/claude-keep-undo#readme",
+  "engines": {
+    "vscode": "^1.90.0",
+    "node": ">=18"
+  },
+  "categories": [
+    "Other",
+    "SCM Providers"
+  ],
+  "keywords": [
+    "claude",
+    "claude code",
+    "diff",
+    "review",
+    "keep undo"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": [
+      {
+        "title": "Review surfaces",
+        "order": 1,
+        "properties": {
+          "claudeKeepUndo.inlineReview": {
+            "type": "string",
+            "order": 1,
+            "enum": [
+              "quickDiff",
+              "comments",
+              "both",
+              "off"
+            ],
+            "enumItemLabels": [
+              "Gutter bars + Quick Diff widget",
+              "Inline comment threads",
+              "Both",
+              "Nothing in the file"
+            ],
+            "enumDescriptions": [
+              "Colored change bars in the editor gutter. Clicking one opens VS Code's Quick Diff widget, which shows the original lines inline with Keep / Undo in its toolbar.",
+              "An inline comment thread at each change, showing the removed and added lines with Keep / Undo in the thread toolbar. Heavier chrome, but unaffected by other source control providers.",
+              "Both the gutter bars and the inline comment threads.",
+              "Neither. Review through the diff view, the changes view and the Quick Fix menu only."
+            ],
+            "default": "quickDiff",
+            "markdownDescription": "How to mark Claude's changes inside the file you are editing. Keep / Undo also remain available as Quick Fixes, on the line-number context menu, and in the changes view.\n\nIn a Git repository the gutter shows Git's bars next to ours — same lines, two providers ([why](https://github.com/FedeFluork/claude-keep-undo#known-limitations))."
+          },
+          "claudeKeepUndo.codeLens": {
+            "type": "string",
+            "order": 2,
+            "enum": [
+              "diffOnly",
+              "always",
+              "off"
+            ],
+            "enumItemLabels": [
+              "Only in the diff editor",
+              "In every editor",
+              "Never"
+            ],
+            "enumDescriptions": [
+              "Show the Keep / Undo rows inside the diff editor only, where nothing else competes for the space.",
+              "Also show them above every change in the ordinary editor. On a file with many small changes this displaces a lot of code.",
+              "No CodeLens anywhere. Keep / Undo remain on Ctrl+. , in the Quick Diff widget and in the changes view."
+            ],
+            "default": "diffOnly",
+            "description": "Where to render the clickable 'Keep · Undo' rows above each change. Every row pushes a line of code down, so by default they appear only inside the diff."
+          },
+          "claudeKeepUndo.codeLensStyle": {
+            "type": "string",
+            "order": 3,
+            "enum": [
+              "text",
+              "emoji"
+            ],
+            "enumItemLabels": [
+              "Plain text — Keep · Undo",
+              "Emoji — ✅ Keep · ❌ Undo"
+            ],
+            "enumDescriptions": [
+              "Reads like the reference and implementation lenses already in the editor.",
+              "Louder and easier to hit, at the cost of ignoring your color theme."
+            ],
+            "default": "text",
+            "description": "Wording of the Keep / Undo CodeLens. Extensions cannot color or bold a CodeLens, so an emoji is the only way to make one stand out."
+          },
+          "claudeKeepUndo.quickFixes": {
+            "type": "string",
+            "order": 4,
+            "enum": [
+              "hunkAndFile",
+              "hunkOnly",
+              "off"
+            ],
+            "enumItemLabels": [
+              "This change and the whole file",
+              "Only this change",
+              "None"
+            ],
+            "enumDescriptions": [
+              "Keep / Undo this change, plus Keep / Undo every change in the file.",
+              "Only the two actions for the change under the cursor.",
+              "Nothing from this extension in the lightbulb menu."
+            ],
+            "default": "hunkAndFile",
+            "description": "Keep / Undo offered in the Quick Fix menu (Ctrl+. / Cmd+.). They only ever appear when the cursor is inside one of Claude's changes."
+          },
+          "claudeKeepUndo.diffMode": {
+            "type": "string",
+            "order": 5,
+            "enum": [
+              "inline",
+              "sideBySide"
+            ],
+            "enumItemLabels": [
+              "Single pane (unified)",
+              "Side by side"
+            ],
+            "enumDescriptions": [
+              "Single-pane (unified) view: old and new lines stacked, no split editor.",
+              "Classic side-by-side view with the original on the left and the new content on the right."
+            ],
+            "default": "inline",
+            "description": "How to lay out the diff for files Claude modified. 'inline' avoids the old/new split."
+          },
+          "claudeKeepUndo.autoOpenDiff": {
+            "type": "boolean",
+            "order": 6,
+            "default": false,
+            "description": "Open the diff view as soon as Claude modifies a file, instead of waiting for you to click."
+          }
+        }
+      },
+      {
+        "title": "Pending queue",
+        "order": 2,
+        "properties": {
+          "claudeKeepUndo.viewBadge": {
+            "type": "boolean",
+            "order": 1,
+            "default": true,
+            "description": "Show the number of files awaiting review on the 'Claude: Changes to Review' section header, so a collapsed section still reports its queue."
+          },
+          "claudeKeepUndo.statusBar": {
+            "type": "string",
+            "order": 2,
+            "enum": [
+              "whenPending",
+              "always",
+              "off"
+            ],
+            "enumItemLabels": [
+              "Only when something is pending",
+              "Always",
+              "Never"
+            ],
+            "enumDescriptions": [
+              "Appears at one pending file and disappears at zero.",
+              "Stays visible and reads 'No Claude changes' when the queue is empty.",
+              "No status bar entry."
+            ],
+            "default": "whenPending",
+            "description": "A status bar entry counting the files awaiting review. Clicking it opens them all in one multi-file diff."
+          },
+          "claudeKeepUndo.explorerBadge": {
+            "type": "string",
+            "order": 3,
+            "enum": [
+              "file",
+              "fileAndFolders",
+              "off"
+            ],
+            "enumItemLabels": [
+              "On the file only",
+              "On the file and its folders",
+              "No badge"
+            ],
+            "enumDescriptions": [
+              "Mark the modified file; leave folders untouched.",
+              "Mark every parent folder up to the workspace root as well — useful in a collapsed tree, but the root then stays marked whenever anything is pending.",
+              "Nothing in the Explorer."
+            ],
+            "default": "file",
+            "description": "Badge and color on files Claude has modified and that are awaiting review."
+          },
+          "claudeKeepUndo.badge": {
+            "type": "string",
+            "order": 4,
+            "default": "✳",
+            "maxLength": 8,
+            "description": "Symbol shown in the Explorer next to files Claude has modified. At most two symbols are drawn. Defaults to '✳', echoing the burst in the Claude logo. Similar alternatives: ❋ ✺ ✶ ✷ ❂."
+          },
+          "claudeKeepUndo.sourceControlList": {
+            "type": "boolean",
+            "order": 5,
+            "default": true,
+            "description": "List the pending files in the Source Control view, next to Git's changes. Turning this off leaves the gutter bars working — they come from the same registration."
+          },
+          "claudeKeepUndo.explorerContextMenu": {
+            "type": "boolean",
+            "order": 6,
+            "default": true,
+            "description": "Add 'Open Diff of Claude's Changes' to the Explorer right-click menu. It is hidden automatically whenever nothing is awaiting review."
+          }
+        }
+      },
+      {
+        "title": "Safety and feedback",
+        "order": 3,
+        "properties": {
+          "claudeKeepUndo.confirmUndo": {
+            "type": "string",
+            "order": 1,
+            "enum": [
+              "risky",
+              "always",
+              "never"
+            ],
+            "enumItemLabels": [
+              "Only when your own work is at risk",
+              "Every time",
+              "Never (except deletions)"
+            ],
+            "enumDescriptions": [
+              "Ask when you have edited the file yourself since Claude did, and before Undo All. A single click on an untouched file goes straight through.",
+              "Ask before every Undo, including a single change.",
+              "Never ask. The recovery snapshot and Ctrl+Z remain the safety net."
+            ],
+            "default": "risky",
+            "description": "When to confirm before an Undo. Deleting a file Claude created is always confirmed, whatever this is set to."
+          },
+          "claudeKeepUndo.feedback.undoNotification": {
+            "type": "boolean",
+            "order": 2,
+            "default": true,
+            "description": "After an Undo, show a notification with a Restore button that puts the file back exactly as Claude left it, still awaiting review."
+          },
+          "claudeKeepUndo.feedback.statusBarMessage": {
+            "type": "boolean",
+            "order": 3,
+            "default": true,
+            "description": "Confirm Keep and Undo with a short status bar message such as 'Kept 3 lines in auth.ts'. Nothing to dismiss."
+          }
+        }
+      },
+      {
+        "title": "Detection",
+        "order": 4,
+        "properties": {
+          "claudeKeepUndo.detection.useHooks": {
+            "type": "boolean",
+            "order": 1,
+            "default": true,
+            "description": "Detect Claude's edits through Claude Code's PreToolUse/PostToolUse hooks (requires installing the hooks in the project)."
+          },
+          "claudeKeepUndo.detection.useTranscript": {
+            "type": "boolean",
+            "order": 2,
+            "default": true,
+            "description": "Detect Claude's edits by reading the session transcript in ~/.claude/projects (automatic zero-config fallback)."
+          },
+          "claudeKeepUndo.promptToInstallHooks": {
+            "type": "boolean",
+            "order": 3,
+            "default": true,
+            "description": "Offer to install the Claude Code hooks on startup when they are missing."
+          },
+          "claudeKeepUndo.trackOutsideWorkspace": {
+            "type": "boolean",
+            "order": 4,
+            "default": false,
+            "description": "Also review Claude's edits to files outside the open folder (its own settings, scratch files, sibling repositories). Off by default: those files cannot be shown in the Explorer, and their baselines would be copied into this workspace's storage."
+          }
+        }
+      }
+    ],
+    "colors": [
+      {
+        "id": "claudeKeepUndo.modifiedResourceForeground",
+        "description": "Color of the file name (and badge) for files Claude modified that are awaiting review. Defaults to the Claude brand orange.",
+        "defaults": {
+          "dark": "#E8997E",
+          "light": "#C15F3C",
+          "highContrast": "#E8997E"
+        }
+      }
+    ],
+    "commands": [
+      {
+        "command": "claudeKeepUndo.openDiff",
+        "title": "Open Diff of Claude's Changes",
+        "category": "Claude Keep/Undo"
+      },
+      {
+        "command": "claudeKeepUndo.openAllChanges",
+        "title": "Review All Claude Changes (Multi-File Diff)",
+        "category": "Claude Keep/Undo",
+        "icon": "$(diff-multiple)"
+      },
+      {
+        "command": "claudeKeepUndo.keepHunk",
+        "title": "Keep This Change",
+        "category": "Claude Keep/Undo",
+        "icon": "$(check)"
+      },
+      {
+        "command": "claudeKeepUndo.undoHunk",
+        "title": "Undo This Change",
+        "category": "Claude Keep/Undo",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "claudeKeepUndo.keepChange",
+        "title": "Keep This Change",
+        "category": "Claude Keep/Undo",
+        "icon": "$(check)"
+      },
+      {
+        "command": "claudeKeepUndo.undoChange",
+        "title": "Undo This Change",
+        "category": "Claude Keep/Undo",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "claudeKeepUndo.keepAtLine",
+        "title": "Keep Claude's Change on This Line",
+        "category": "Claude Keep/Undo"
+      },
+      {
+        "command": "claudeKeepUndo.undoAtLine",
+        "title": "Undo Claude's Change on This Line",
+        "category": "Claude Keep/Undo"
+      },
+      {
+        "command": "claudeKeepUndo.keepAtCursor",
+        "title": "Keep the Change at the Cursor",
+        "category": "Claude Keep/Undo",
+        "icon": "$(check)"
+      },
+      {
+        "command": "claudeKeepUndo.undoAtCursor",
+        "title": "Undo the Change at the Cursor",
+        "category": "Claude Keep/Undo",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "claudeKeepUndo.nextChange",
+        "title": "Go to Next Claude Change",
+        "category": "Claude Keep/Undo",
+        "icon": "$(arrow-down)"
+      },
+      {
+        "command": "claudeKeepUndo.previousChange",
+        "title": "Go to Previous Claude Change",
+        "category": "Claude Keep/Undo",
+        "icon": "$(arrow-up)"
+      },
+      {
+        "command": "claudeKeepUndo.keepFile",
+        "title": "Keep All Changes in This File",
+        "category": "Claude Keep/Undo",
+        "icon": "$(check)"
+      },
+      {
+        "command": "claudeKeepUndo.undoFile",
+        "title": "Undo All Changes in This File",
+        "category": "Claude Keep/Undo",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "claudeKeepUndo.keepAll",
+        "title": "Keep All of Claude's Changes",
+        "category": "Claude Keep/Undo",
+        "icon": "$(check-all)"
+      },
+      {
+        "command": "claudeKeepUndo.undoAll",
+        "title": "Undo All of Claude's Changes",
+        "category": "Claude Keep/Undo",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "claudeKeepUndo.restoreLastUndo",
+        "title": "Restore the Last Undo",
+        "category": "Claude Keep/Undo",
+        "icon": "$(redo)"
+      },
+      {
+        "command": "claudeKeepUndo.installHooks",
+        "title": "Install Claude Code Hooks in This Project",
+        "category": "Claude Keep/Undo",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "claudeKeepUndo.openSettings",
+        "title": "Settings and Setup",
+        "category": "Claude Keep/Undo",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "claudeKeepUndo.openWalkthrough",
+        "title": "Open the Getting Started Walkthrough",
+        "category": "Claude Keep/Undo"
+      },
+      {
+        "command": "claudeKeepUndo.refresh",
+        "title": "Refresh Change Status",
+        "category": "Claude Keep/Undo",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "claudeKeepUndo.revealSnapshots",
+        "title": "Reveal Recovery Snapshots",
+        "category": "Claude Keep/Undo"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "claudeKeepUndo.nextChange",
+        "key": "ctrl+alt+n",
+        "mac": "cmd+alt+n",
+        "when": "editorTextFocus && claudeKeepUndo.activeDiffTracked"
+      },
+      {
+        "command": "claudeKeepUndo.previousChange",
+        "key": "ctrl+alt+p",
+        "mac": "cmd+alt+p",
+        "when": "editorTextFocus && claudeKeepUndo.activeDiffTracked"
+      },
+      {
+        "command": "claudeKeepUndo.keepAtCursor",
+        "key": "ctrl+alt+k",
+        "mac": "cmd+alt+k",
+        "when": "editorTextFocus && claudeKeepUndo.activeDiffTracked"
+      },
+      {
+        "command": "claudeKeepUndo.undoAtCursor",
+        "key": "ctrl+alt+u",
+        "mac": "cmd+alt+u",
+        "when": "editorTextFocus && claudeKeepUndo.activeDiffTracked"
+      }
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "claudeKeepUndo.changes",
+          "name": "Claude: Changes to Review",
+          "icon": "$(git-compare)",
+          "contextualTitle": "Claude Keep/Undo"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "claudeKeepUndo.changes",
+        "when": "!claudeKeepUndo.hooksInstalled",
+        "contents": "No Claude changes awaiting review.\nInstall the Claude Code hooks to capture the exact content of every file before Claude edits it. Without them, edits that cannot be reconstructed exactly are reported as not reviewable.\n[Install Claude Code hooks](command:claudeKeepUndo.installHooks)\n[Settings and setup](command:claudeKeepUndo.openSettings)"
+      },
+      {
+        "view": "claudeKeepUndo.changes",
+        "when": "claudeKeepUndo.hooksInstalled",
+        "contents": "Detection is active — the Claude Code hooks are installed in this project.\nWhen Claude edits your files, they appear here with Keep / Undo buttons.\n[Settings and setup](command:claudeKeepUndo.openSettings)"
+      }
+    ],
+    "walkthroughs": [
+      {
+        "id": "setup",
+        "title": "Review Claude Code's edits",
+        "description": "Turn Claude's edits into a review queue you can Keep or Undo, one change at a time.",
+        "steps": [
+          {
+            "id": "installHooks",
+            "title": "Install the Claude Code hooks",
+            "description": "The hooks copy each file aside just before Claude writes to it, which is what makes an exact before/after possible.\n[Install the hooks](command:claudeKeepUndo.installHooks)",
+            "media": {
+              "markdown": "media/walkthrough/hooks.md",
+              "altText": "How the hooks capture a baseline before each edit"
+            },
+            "completionEvents": [
+              "onContext:claudeKeepUndo.hooksInstalled",
+              "onCommand:claudeKeepUndo.installHooks"
+            ]
+          },
+          {
+            "id": "letClaudeEdit",
+            "title": "Let Claude edit a file",
+            "description": "Run Claude Code as usual. Edited files are marked in the Explorer and collected under 'Claude: Changes to Review'.\n[Show the changes view](command:claudeKeepUndo.changes.focus)",
+            "media": {
+              "markdown": "media/walkthrough/queue.md",
+              "altText": "The pending queue in the Explorer and the status bar"
+            },
+            "completionEvents": [
+              "onContext:claudeKeepUndo.hasChanges"
+            ]
+          },
+          {
+            "id": "keepOrUndo",
+            "title": "Keep or Undo each change",
+            "description": "Click a coloured bar in the gutter to open the change, then Keep it or Undo it. Ctrl+Alt+N and Ctrl+Alt+P walk through the changes in a file.\n[Review everything pending](command:claudeKeepUndo.openAllChanges)",
+            "media": {
+              "markdown": "media/walkthrough/review.md",
+              "altText": "Keep and Undo in the Quick Diff widget"
+            }
+          },
+          {
+            "id": "chooseSurfaces",
+            "title": "Choose what you want to see",
+            "description": "Gutter bars, CodeLens rows, comment threads, badges, status bar — pick a preset or set each one on its own.\n[Open settings and setup](command:claudeKeepUndo.openSettings)",
+            "media": {
+              "markdown": "media/walkthrough/surfaces.md",
+              "altText": "The review surfaces this extension can show"
+            },
+            "completionEvents": [
+              "onCommand:claudeKeepUndo.openSettings"
+            ]
+          }
+        ]
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "claudeKeepUndo.keepHunk",
+          "when": "false"
+        },
+        {
+          "command": "claudeKeepUndo.undoHunk",
+          "when": "false"
+        },
+        {
+          "command": "claudeKeepUndo.keepChange",
+          "when": "false"
+        },
+        {
+          "command": "claudeKeepUndo.undoChange",
+          "when": "false"
+        },
+        {
+          "command": "claudeKeepUndo.keepAtLine",
+          "when": "false"
+        },
+        {
+          "command": "claudeKeepUndo.undoAtLine",
+          "when": "false"
+        }
+      ],
+      "scm/change/title": [
+        {
+          "command": "claudeKeepUndo.keepChange",
+          "when": "originalResourceScheme == claude-baseline",
+          "group": "1_modification@1"
+        },
+        {
+          "command": "claudeKeepUndo.undoChange",
+          "when": "originalResourceScheme == claude-baseline",
+          "group": "1_modification@2"
+        }
+      ],
+      "editor/lineNumber/context": [
+        {
+          "command": "claudeKeepUndo.keepAtLine",
+          "when": "claudeKeepUndo.activeDiffTracked",
+          "group": "1_claudeKeepUndo@1"
+        },
+        {
+          "command": "claudeKeepUndo.undoAtLine",
+          "when": "claudeKeepUndo.activeDiffTracked",
+          "group": "1_claudeKeepUndo@2"
+        }
+      ],
+      "comments/commentThread/title": [
+        {
+          "command": "claudeKeepUndo.keepHunk",
+          "when": "commentController == claudeKeepUndo && commentThread == claudeHunk",
+          "group": "inline@1"
+        },
+        {
+          "command": "claudeKeepUndo.undoHunk",
+          "when": "commentController == claudeKeepUndo && commentThread == claudeHunk",
+          "group": "inline@2"
+        }
+      ],
+      "scm/title": [
+        {
+          "command": "claudeKeepUndo.openAllChanges",
+          "when": "scmProvider == claudeKeepUndo",
+          "group": "navigation@1"
+        },
+        {
+          "command": "claudeKeepUndo.keepAll",
+          "when": "scmProvider == claudeKeepUndo",
+          "group": "navigation@2"
+        },
+        {
+          "command": "claudeKeepUndo.undoAll",
+          "when": "scmProvider == claudeKeepUndo",
+          "group": "navigation@3"
+        }
+      ],
+      "scm/resourceState/context": [
+        {
+          "command": "claudeKeepUndo.keepFile",
+          "when": "scmProvider == claudeKeepUndo",
+          "group": "inline@1"
+        },
+        {
+          "command": "claudeKeepUndo.undoFile",
+          "when": "scmProvider == claudeKeepUndo",
+          "group": "inline@2"
+        },
+        {
+          "command": "claudeKeepUndo.openDiff",
+          "when": "scmProvider == claudeKeepUndo",
+          "group": "navigation@1"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "claudeKeepUndo.openAllChanges",
+          "when": "view == claudeKeepUndo.changes",
+          "group": "navigation@0"
+        },
+        {
+          "command": "claudeKeepUndo.keepAll",
+          "when": "view == claudeKeepUndo.changes",
+          "group": "navigation@1"
+        },
+        {
+          "command": "claudeKeepUndo.undoAll",
+          "when": "view == claudeKeepUndo.changes",
+          "group": "navigation@2"
+        },
+        {
+          "command": "claudeKeepUndo.refresh",
+          "when": "view == claudeKeepUndo.changes",
+          "group": "navigation@3"
+        },
+        {
+          "command": "claudeKeepUndo.openSettings",
+          "when": "view == claudeKeepUndo.changes",
+          "group": "navigation@4"
+        },
+        {
+          "command": "claudeKeepUndo.restoreLastUndo",
+          "when": "view == claudeKeepUndo.changes && claudeKeepUndo.canRestoreUndo",
+          "group": "1_recovery@1"
+        },
+        {
+          "command": "claudeKeepUndo.revealSnapshots",
+          "when": "view == claudeKeepUndo.changes",
+          "group": "1_recovery@2"
+        },
+        {
+          "command": "claudeKeepUndo.openWalkthrough",
+          "when": "view == claudeKeepUndo.changes",
+          "group": "9_help@1"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "claudeKeepUndo.keepFile",
+          "when": "view == claudeKeepUndo.changes && viewItem == claudeChange",
+          "group": "inline@1"
+        },
+        {
+          "command": "claudeKeepUndo.undoFile",
+          "when": "view == claudeKeepUndo.changes && viewItem == claudeChange",
+          "group": "inline@2"
+        },
+        {
+          "command": "claudeKeepUndo.keepHunk",
+          "when": "view == claudeKeepUndo.changes && viewItem == claudeHunk",
+          "group": "inline@1"
+        },
+        {
+          "command": "claudeKeepUndo.undoHunk",
+          "when": "view == claudeKeepUndo.changes && viewItem == claudeHunk",
+          "group": "inline@2"
+        },
+        {
+          "command": "claudeKeepUndo.installHooks",
+          "when": "view == claudeKeepUndo.changes && viewItem == claudeUnreviewable",
+          "group": "inline@1"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "claudeKeepUndo.keepFile",
+          "when": "claudeKeepUndo.activeDiffTracked",
+          "group": "navigation@1"
+        },
+        {
+          "command": "claudeKeepUndo.undoFile",
+          "when": "claudeKeepUndo.activeDiffTracked",
+          "group": "navigation@2"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "claudeKeepUndo.openDiff",
+          "when": "resourceScheme == file && claudeKeepUndo.hasChanges && claudeKeepUndo.explorerMenu",
+          "group": "navigation@99"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "node scripts/check-encoding.mjs && eslint src --ext .ts && prettier --check \"src/**/*.ts\" \"*.json\"",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "test:unit": "npm run compile && node --test \"out/test/unit/*.test.js\"",
+    "test:integration": "npm run compile && vscode-test",
+    "test": "npm run test:unit && npm run test:integration",
+    "package": "npx @vscode/vsce package"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.6",
+    "@types/node": "^20.11.0",
+    "@types/vscode": "1.90.0",
+    "@typescript-eslint/eslint-plugin": "^7.18.0",
+    "@typescript-eslint/parser": "^7.18.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.1.0",
+    "eslint": "^8.57.0",
+    "prettier": "^3.3.3",
+    "typescript": "^5.4.0"
+  },
+  "icon": "icon.png",
+  "galleryBanner": {
+    "color": "#1B1A17",
+    "theme": "dark"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "The extension reads and writes files in the workspace and installs a hook command that Claude Code executes, so it stays disabled until the workspace is trusted."
+    },
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "Baselines are read from and written to the local filesystem, and the Claude Code session transcripts are local files."
+    }
+  }
+}

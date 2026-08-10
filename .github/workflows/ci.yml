@@ -1,0 +1,187 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch cancels the older run. Tags are excluded:
+# a release run must never be cancelled halfway through publishing.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ["18", "20"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # The integration tests download a full VS Code build (~300 MB) on first
+      # run. Cache it per VS Code version so only the first job of a given
+      # version pays for it.
+      - name: Cache VS Code for integration tests
+        uses: actions/cache@v4
+        with:
+          path: .vscode-test
+          key: vscode-test-${{ runner.os }}-${{ hashFiles('.vscode-test.mjs') }}
+          restore-keys: vscode-test-${{ runner.os }}-
+
+      - run: npm ci
+      - run: npm run compile
+      # `npm run lint` also runs scripts/check-encoding.mjs, which fails the build
+      # on a NUL byte in any source file — invisible on screen, harmless to the
+      # compiler, and enough to make the file binary to git and to this
+      # extension's own UTF-8 check.
+      - run: npm run lint
+      - run: npm run test:unit
+
+      # A headless Linux runner has no display, so VS Code needs a virtual one.
+      - name: Integration tests (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm run test:integration
+      - name: Integration tests (macOS / Windows)
+        if: runner.os != 'Linux'
+        run: npm run test:integration
+
+  package:
+    name: Package
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+
+      # Build the artifact once. The publish jobs upload exactly this file, so
+      # what reaches the Marketplace is what the test matrix just ran against.
+      - name: Build .vsix
+        run: npx @vscode/vsce package --out extension.vsix
+
+      - name: Verify the package contents
+        run: |
+          set -euo pipefail
+          npx @vscode/vsce ls > packaged.txt
+          cat packaged.txt
+          ! grep -q 'out/test' packaged.txt || { echo "::error::compiled tests leaked into the package"; exit 1; }
+          ! grep -qE '\.map$' packaged.txt || { echo "::error::source maps leaked into the package"; exit 1; }
+          grep -q '^icon.png$' packaged.txt || { echo "::error::the Marketplace icon is missing"; exit 1; }
+          grep -q '^hooks/keepundo-hook.mjs$' packaged.txt || { echo "::error::the hook script is missing"; exit 1; }
+          # The internal review documents quote the source verbatim and carry
+          # absolute paths from the author's machine. .vscodeignore listed them by
+          # name, so each new one shipped until somebody noticed; this is the check
+          # that notices.
+          ! grep -qiE '^(REVIEW|PUBLISHING|CONTRIBUTING)' packaged.txt || { echo "::error::an internal document leaked into the package"; exit 1; }
+          ! grep -q '.DS_Store' packaged.txt || { echo "::error::a .DS_Store leaked into the package"; exit 1; }
+          # Only README.md and CHANGELOG.md are meant to be published, plus the
+          # walkthrough pages under media/, which the manifest points at. This was a
+          # count of every packaged .md and `-le 2`, which those four pages already
+          # exceeded on their own — the check could only ever fail. Matching by path
+          # says *which* file is unexpected instead of reporting a number.
+          unexpected_md="$(grep -iE '\.md$' packaged.txt | grep -ivE '^(README|CHANGELOG)\.md$|^media/walkthrough/[^/]+\.md$' || true)"
+          test -z "$unexpected_md" || { echo "::error::unexpected markdown in the package: $(echo "$unexpected_md" | tr '\n' ' ')"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vsix
+          path: extension.vsix
+          if-no-files-found: error
+
+  publish-marketplace:
+    name: Publish · VS Code Marketplace
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # Point this at a GitHub Environment so you can require an approval before
+    # anything is published, and so the Entra federated credential can be
+    # scoped to it. Create it under Settings → Environments.
+    environment: marketplace
+    permissions:
+      contents: read
+      id-token: write # required by the Entra ID (OIDC) route
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: vsix
+
+      # ── Route A (recommended): Microsoft Entra ID, no stored secret ────────
+      # Azure DevOps retires global Personal Access Tokens on 2026-12-01, so
+      # this is the route that keeps working. Enable it by setting the
+      # repository variable PUBLISH_AUTH to "entra".
+      - name: Azure login (federated identity)
+        if: vars.PUBLISH_AUTH == 'entra'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Publish (Entra ID)
+        if: vars.PUBLISH_AUTH == 'entra'
+        run: >
+          npx @vscode/vsce publish
+          --packagePath extension.vsix
+          --skip-duplicate
+          --azure-credential
+
+      # ── Route B: Personal Access Token ────────────────────────────────────
+      # Simpler to set up, but stops working on 2026-12-01. The token goes in
+      # the environment, never on the command line, so it cannot leak into a
+      # process listing.
+      - name: Publish (PAT)
+        if: vars.PUBLISH_AUTH != 'entra'
+        run: npx @vscode/vsce publish --packagePath extension.vsix --skip-duplicate
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+  publish-openvsx:
+    name: Publish · Open VSX
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: open-vsx
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: vsix
+      - name: Publish
+        run: npx ovsx publish extension.vsix --skip-duplicate
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+
+  release:
+    name: Attach the .vsix to the GitHub release
+    needs: [publish-marketplace, publish-openvsx]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # needed to create the release
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: vsix
+      - name: Rename for the release page
+        run: mv extension.vsix claude-keep-undo-${GITHUB_REF_NAME#v}.vsix
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: claude-keep-undo-*.vsix
+          generate_release_notes: true

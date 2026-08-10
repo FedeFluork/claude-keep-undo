@@ -1,0 +1,52 @@
+# NOTE: vsce applies negations (!) *last*, whatever the order — a `!out/**/*.js`
+# rule would re-include the compiled tests no matter where it sits. So the
+# compiled output is included by simply not excluding it, and negations are used
+# only where something above genuinely has to be undone.
+
+# Sources and tooling — the package ships compiled JS only.
+.vscode/**
+.github/**
+src/**
+**/*.ts
+**/*.map
+tsconfig.json
+node_modules/**
+package-lock.json
+
+# Compiled tests, their harness, and the lint configuration
+out/test/**
+scripts/**
+.vscode-test.mjs
+.vscode-test/**
+.eslintrc.json
+.prettierrc.json
+.prettierignore
+
+# VCS and build artifacts
+.git/**
+.gitignore
+.gitattributes
+*.vsix
+*.zip
+
+# Repo-only documentation (README.md, LICENSE and CHANGELOG.md are shipped)
+#
+# Matched by *pattern*, not by name. These were listed individually, and the next
+# review document — REVIEW_2026-08-09.md — was therefore packaged: 375 KB of
+# internal notes quoting the source verbatim, with absolute paths from the author's
+# machine and a worked reproduction of every unfixed defect, published to the
+# Marketplace. Anything named REVIEW* stays out by construction now.
+REVIEW*.md
+REVIEW*/**
+PUBLISHING.md
+CONTRIBUTING.md
+# The long-form companion to the README — public, but repository-only. Shipping it
+# would be dead weight: vsce rewrites every relative link in the packaged README to
+# the repository URL, so the "Full reference" link resolves against GitHub whether
+# or not the file is in the .vsix.
+REFERENCE.md
+
+# Local dev/runtime state — must never ship in the package
+.claude/**
+# The bare name matches only the root copy; macOS leaves one in every directory.
+**/.DS_Store

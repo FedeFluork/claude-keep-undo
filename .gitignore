@@ -1,0 +1,101 @@
+# --- Dependencies ---------------------------------------------------------
+node_modules/
+jspm_packages/
+.pnp
+.pnp.js
+.yarn/cache/
+.yarn/unplugged/
+.yarn/build-state.yml
+.yarn/install-state.gz
+
+# --- Build output ---------------------------------------------------------
+out/
+dist/
+build/
+*.tsbuildinfo
+
+# --- Extension packages ---------------------------------------------------
+*.vsix
+*.vsix.zip
+claude-keep-undo-*.zip
+
+# --- Test / tooling caches ------------------------------------------------
+.vscode-test/
+.vscode-test-web/
+coverage/
+.nyc_output/
+.eslintcache
+
+# --- Logs & diagnostics ---------------------------------------------------
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+report.*.json
+
+# --- Local environment / secrets ------------------------------------------
+# Never commit publisher tokens (VSCE_PAT / OVSX_PAT) or local overrides.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.npmrc
+.vsce
+
+# --- Internal documents ---------------------------------------------------
+# Working documents, not part of the published project: the code reviews quote
+# the source verbatim and carry absolute paths from this machine, and the
+# release runbook holds publisher-account specifics. README.md and CHANGELOG.md
+# are the only markdown documents meant for the repository.
+REVIEW*.md
+REVIEW*/
+PUBLISHING.md
+
+# --- Editor / IDE ---------------------------------------------------------
+# .vscode/ is intentionally tracked: launch.json + tasks.json are part of the
+# contributor setup. Only the machine-local files inside it are ignored.
+.vscode/settings.json
+.vscode/*.local.json
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# --- OS cruft -------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# --- Claude Code local state ----------------------------------------------
+# Runtime state written by the extension and by the Claude Code hooks. It holds
+# verbatim copies of your source files (baselines), is machine-specific, and
+# must never be committed.
+.claude/keepundo/
+# settings.local.json is Claude Code's machine-local file and is where this
+# extension registers its hooks, because the command holds absolute paths to
+# this machine's extension install and workspace storage. The shared
+# settings.json is deliberately NOT ignored: it is meant to be committed, and
+# hiding it from contributors is how a stale hook registration survives unseen.
+.claude/settings.local.json
+# The installer keeps one rollback copy before its first write to either file.
+.claude/settings.json.bak
+.claude/settings.local.json.bak
+CLAUDE.local.md
+
+# Fixture workspace state created by the integration tests. Scoped to the
+# fixture on purpose: a `**/.claude/settings.json` rule here would also match the
+# repository's own shared settings file and undo the exception made above.
+src/test/fixtures/**/.claude/
+src/test/fixtures/workspace/*
+!src/test/fixtures/workspace/README.md
+.vscode-test/
