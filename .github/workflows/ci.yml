@@ -24,7 +24,16 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        node: ["18", "20"]
+        # Node 18 was testing a runtime this extension never meets. VS Code 1.90
+        # — the oldest release the manifest supports — runs Electron 29.4.0,
+        # whose bundled Node is 20.9.0, so the extension host is 20 at the
+        # earliest. The integration harness cannot run on 18 at all:
+        # @vscode/test-cli declares `engines.node: ">=22"`, and its yargs 18
+        # pulls in string-width 8 (`engines.node: ">=20"`), whose source uses the
+        # RegExp `v` flag — a SyntaxError at parse time on 18, which is what
+        # broke the job. 22 is added because it is the version the harness
+        # actually claims to support; 20 stays because it is the real floor.
+        node: ["20", "22"]
     steps:
       - uses: actions/checkout@v4
 
