@@ -2,7 +2,7 @@
   "name": "claude-keep-undo",
   "displayName": "Keep / Undo for Claude Code",
   "description": "Review every change Claude Code makes to your files and Keep or Undo them hunk by hunk, Copilot-style.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "publisher": "FedeFluork",
   "author": {
     "name": "FedeFluork"
