@@ -51,9 +51,16 @@ report.*.json
 # the source verbatim and carry absolute paths from this machine, and the
 # release runbook holds publisher-account specifics. README.md and CHANGELOG.md
 # are the only markdown documents meant for the repository.
-REVIEW*.md
-REVIEW*/
-PUBLISHING.md
+#
+# A pattern with no slash matches at every
+# depth, and git sets core.ignorecase=true on macOS, so `REVIEW*.md` also
+# swallowed media/walkthrough/review.md — a walkthrough page the manifest points
+# at. It never got committed, so CI checked out a tree without it: the unit test
+# that verifies every referenced walkthrough file exists failed, and the .vsix
+# built on CI would have shipped a walkthrough step with nothing behind it.
+/REVIEW*.md
+/REVIEW*/
+/PUBLISHING.md
 
 # --- Editor / IDE ---------------------------------------------------------
 # .vscode/ is intentionally tracked: launch.json + tasks.json are part of the

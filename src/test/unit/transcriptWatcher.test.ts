@@ -91,7 +91,12 @@ const { sessionDirFor } = loader._load("../../util", module, false) as {
   sessionDirFor: (cwd: string) => string;
 };
 
-const realHome = process.env.HOME;
+// `sessionDirFor` resolves against `os.homedir()`, which reads HOME on POSIX and
+// USERPROFILE on Windows. Stubbing only HOME leaves the runner's real home in
+// effect on Windows, where every test in this file then fails in `beforeEach`
+// with "the stub HOME must be in effect" — so both are stubbed.
+const HOME_VARS = ["HOME", "USERPROFILE"] as const;
+const realHomeVars = HOME_VARS.map((key) => [key, process.env[key]] as const);
 let home: string;
 let cwd: string;
 let transcript: string;
@@ -102,7 +107,9 @@ let sequence = 0;
 
 beforeEach(() => {
   home = fs.mkdtempSync(path.join(os.tmpdir(), "keepundo-tw-"));
-  process.env.HOME = home;
+  for (const key of HOME_VARS) {
+    process.env[key] = home;
+  }
   cwd = path.join(home, "project");
   fs.mkdirSync(cwd, { recursive: true });
   const sessionDir = sessionDirFor(cwd);
@@ -116,7 +123,16 @@ beforeEach(() => {
 afterEach(() => {
   watcher?.dispose();
   watcher = undefined;
-  process.env.HOME = realHome;
+  for (const [key, value] of realHomeVars) {
+    // Assigning `undefined` would put the string "undefined" in the environment,
+    // which is not the same as the variable being unset — and on Windows HOME is
+    // normally unset.
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
   fs.rmSync(home, { recursive: true, force: true });
 });
 
