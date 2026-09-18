@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { ChangeStore } from "../changeStore";
+import { ReviewStore } from "../changeStore";
 import { Hunk, hunkLineRange } from "../diff";
 import { wantsCommentThreads } from "../settings";
 import { hunkDiffText, summarizeHunk } from "./format";
@@ -31,7 +31,7 @@ export class CommentReviewController implements vscode.Disposable {
   private timer: NodeJS.Timeout | undefined;
   private disposed = false;
 
-  constructor(private readonly store: ChangeStore) {
+  constructor(private readonly store: ReviewStore) {
     this.disposables.push(
       store.onDidChange(() => this.schedule()),
       vscode.window.onDidChangeVisibleTextEditors(() => this.schedule()),

@@ -1,8 +1,9 @@
 import * as path from "path";
 import * as vscode from "vscode";
-import { ChangeStore } from "../changeStore";
+import { ReviewStore } from "../changeStore";
 import { Hunk } from "../diff";
 import { viewBadge } from "../settings";
+import { isInsideRoot, normalizePath, owningRoot } from "../util";
 import {
   EOL_ONLY_EXPLANATION,
   EOL_ONLY_LABEL,
@@ -16,6 +17,7 @@ import {
 } from "./format";
 
 export type ChangeNode =
+  | { type: "folder"; root: string; name: string }
   | { type: "file"; path: string }
   | { type: "hunk"; path: string; index: number; fingerprint: string }
   | { type: "unreviewable"; path: string };
@@ -27,6 +29,9 @@ const AUTO_EXPAND_LIMIT = 3;
  * The "Claude: Changes to Review" view in the Explorer. Top level lists the
  * modified files; expanding a file lists its individual hunks. Both levels carry
  * inline Keep/Undo buttons.
+ *
+ * In a multi-root window the top level is the folders that have something to
+ * review; expanding a folder lists its files. A single-root window stays flat.
  *
  * Files Claude changed but that could not be given an exact baseline are listed
  * too, in their own rows: omitting them silently would look like the extension
@@ -41,7 +46,7 @@ export class ChangesViewProvider
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
   private readonly listener: vscode.Disposable;
 
-  constructor(private readonly store: ChangeStore) {
+  constructor(private readonly store: ReviewStore) {
     this.listener = store.onDidChange(() =>
       this._onDidChangeTreeData.fire(undefined)
     );
@@ -49,16 +54,20 @@ export class ChangesViewProvider
 
   getChildren(element?: ChangeNode): ChangeNode[] {
     if (!element) {
-      return [
-        ...this.store.getTracked().map((f) => ({
-          type: "file" as const,
-          path: f.path,
-        })),
-        ...this.store.getUnreviewable().map((u) => ({
-          type: "unreviewable" as const,
-          path: u.path,
-        })),
-      ];
+      const folders = vscode.workspace.workspaceFolders ?? [];
+      if (folders.length > 1) {
+        return folders
+          .filter((folder) => this.nodesInFolder(folder.uri.fsPath).length > 0)
+          .map((folder) => ({
+            type: "folder" as const,
+            root: folder.uri.fsPath,
+            name: folder.name,
+          }));
+      }
+      return this.fileNodes();
+    }
+    if (element.type === "folder") {
+      return this.nodesInFolder(element.root);
     }
     if (element.type === "file") {
       const hunks = this.store.get(element.path)?.hunks ?? [];
@@ -74,10 +83,22 @@ export class ChangesViewProvider
 
   /** Lets callers reveal a hunk in the tree from the editor. */
   getParent(node: ChangeNode): ChangeNode | undefined {
-    return node.type === "hunk" ? { type: "file", path: node.path } : undefined;
+    if (node.type === "hunk") {
+      return { type: "file", path: node.path };
+    }
+    if (
+      (node.type === "file" || node.type === "unreviewable") &&
+      (vscode.workspace.workspaceFolders?.length ?? 0) > 1
+    ) {
+      return this.folderNodeFor(node.path);
+    }
+    return undefined;
   }
 
   getTreeItem(node: ChangeNode): vscode.TreeItem {
+    if (node.type === "folder") {
+      return this.folderItem(node);
+    }
     if (node.type === "unreviewable") {
       return this.unreviewableItem(node);
     }
@@ -85,6 +106,69 @@ export class ChangesViewProvider
       return this.fileItem(node);
     }
     return this.hunkItem(node);
+  }
+
+  private fileNodes(): ChangeNode[] {
+    return [
+      ...this.store.getTracked().map((f) => ({
+        type: "file" as const,
+        path: f.path,
+      })),
+      ...this.store.getUnreviewable().map((u) => ({
+        type: "unreviewable" as const,
+        path: u.path,
+      })),
+    ];
+  }
+
+  private nodesInFolder(root: string): ChangeNode[] {
+    return this.fileNodes().filter((node) => {
+      if (node.type !== "file" && node.type !== "unreviewable") {
+        return false;
+      }
+      return this.ownedBy(root, node.path);
+    });
+  }
+
+  private ownedBy(root: string, absPath: string): boolean {
+    if (!isInsideRoot(root, absPath)) {
+      return false;
+    }
+    const roots = (vscode.workspace.workspaceFolders ?? []).map(
+      (folder) => folder.uri.fsPath
+    );
+    const owner = owningRoot(roots, absPath);
+    return owner !== undefined && normalizePath(owner) === normalizePath(root);
+  }
+
+  private folderNodeFor(absPath: string): ChangeNode | undefined {
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    const owner = owningRoot(
+      folders.map((folder) => folder.uri.fsPath),
+      absPath
+    );
+    const folder = folders.find(
+      (f) =>
+        owner !== undefined &&
+        normalizePath(f.uri.fsPath) === normalizePath(owner)
+    );
+    return folder
+      ? { type: "folder", root: folder.uri.fsPath, name: folder.name }
+      : undefined;
+  }
+
+  private folderItem(node: ChangeNode & { type: "folder" }): vscode.TreeItem {
+    const count = this.nodesInFolder(node.root).length;
+    const item = new vscode.TreeItem(
+      node.name,
+      vscode.TreeItemCollapsibleState.Expanded
+    );
+    item.id = `folder:${node.root}`;
+    item.contextValue = "claudeFolder";
+    item.iconPath = vscode.ThemeIcon.Folder;
+    item.description = String(count);
+    item.tooltip = node.root;
+    return item;
   }
 
   private fileItem(node: ChangeNode & { type: "file" }): vscode.TreeItem {
@@ -221,7 +305,7 @@ export class ChangesView implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
 
   constructor(
-    private readonly store: ChangeStore,
+    private readonly store: ReviewStore,
     provider: ChangesViewProvider
   ) {
     this.view = vscode.window.createTreeView("claudeKeepUndo.changes", {

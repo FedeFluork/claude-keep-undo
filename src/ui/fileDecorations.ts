@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { ChangeStore } from "../changeStore";
+import { ReviewStore } from "../changeStore";
 import { badgeGlyph, explorerBadgeMode } from "../settings";
 import { pluralChanges } from "./format";
 
@@ -21,7 +21,7 @@ export class ClaudeFileDecorationProvider
   readonly onDidChangeFileDecorations = this._onDidChange.event;
   private readonly disposables: vscode.Disposable[] = [];
 
-  constructor(private readonly store: ChangeStore) {
+  constructor(private readonly store: ReviewStore) {
     this.disposables.push(
       store.onDidChange((uri) => this._onDidChange.fire(uri ?? undefined)),
       vscode.workspace.onDidChangeConfiguration((e) => {

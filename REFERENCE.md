@@ -26,19 +26,20 @@ extension.
 
 ## Requirements
 
-| | |
-|---|---|
-| VS Code | `^1.90.0` (the Multi Diff Editor needs 1.86+; 1.90 is a deliberate safety margin) |
-| Node.js | `>= 18` on your `PATH` — required by the hook script (see below) |
+|             |                                                                                                                   |
+| ----------- | ----------------------------------------------------------------------------------------------------------------- |
+| VS Code     | `^1.90.0` (the Multi Diff Editor needs 1.86+; 1.90 is a deliberate safety margin)                                 |
+| Node.js     | `>= 18` on your `PATH` — required by the hook script (see below)                                                  |
 | Claude Code | Any version that writes session transcripts to `~/.claude/projects` and supports `PreToolUse`/`PostToolUse` hooks |
 
-A workspace folder must be open; the extension is a no-op in an empty window.
+A workspace folder must be open; multi-root workspaces are supported, with
+each folder keeping its own review queue.
 
 ---
 
 ## Installation
 
-**From the Marketplace** — search for *Keep / Undo for Claude Code* in the
+**From the Marketplace** — search for _Keep / Undo for Claude Code_ in the
 Extensions view (`Ctrl+Shift+X` / `Cmd+Shift+X`), or:
 
 ```bash
@@ -66,7 +67,7 @@ code --install-extension claude-keep-undo-<version>.vsix --force
    press **Keep** or **Undo** there, or put the cursor on a change and hit
    `Ctrl+.` / `Cmd+.`.
 6. Prefer a diff view? Click the file in the changes view, right-click →
-   *Open Diff of Claude's Changes*, or enable `claudeKeepUndo.autoOpenDiff`.
+   _Open Diff of Claude's Changes_, or enable `claudeKeepUndo.autoOpenDiff`.
    For a bird's-eye pass, run **Review All Claude Changes (Multi-File Diff)**.
 7. When you are done, Keep All / Undo All from the editor title bar, the changes
    view toolbar, or the Source Control title bar.
@@ -88,12 +89,12 @@ IDE-integrated assistant. This extension adds that step back.
   in the real editor — no diff tab needed. Click one and VS Code's Quick Diff
   widget opens **inline, inside the file**, showing the original lines with
   **Keep** and **Undo** in its toolbar.
-- **Inline change threads** *(optional)*. Set
+- **Inline change threads** _(optional)_. Set
   `claudeKeepUndo.inlineReview` to `comments` and each change becomes a widget
-  rendered *between* the editor lines, showing the removed and added lines as a
+  rendered _between_ the editor lines, showing the removed and added lines as a
   unified diff with Keep / Undo in its header.
 - **Quick Fixes.** Put the cursor on a change and press `Ctrl+.` / `Cmd+.` —
-  *Keep this Claude change* / *Undo this Claude change*, entirely from the
+  _Keep this Claude change_ / _Undo this Claude change_, entirely from the
   keyboard. They appear only when the cursor is inside a change, so an unrelated
   Quick Fix elsewhere in the file is never mixed with them.
 - **Line-number menu.** Right-click the line number of a change for the same two
@@ -115,16 +116,16 @@ IDE-integrated assistant. This extension adds that step back.
   the Claude brand orange until you review them.
 - **Status bar.** `Claude: 3 files` while anything is pending, wherever you are
   in the workbench. Click it to open everything in one diff.
-- **Source Control entry.** A *Claude Changes* provider lists every pending file
+- **Source Control entry.** A _Claude Changes_ provider lists every pending file
   with inline Keep / Undo and a count badge.
-- **Multi-file diff.** *Review All Claude Changes* opens every pending file in a
+- **Multi-file diff.** _Review All Claude Changes_ opens every pending file in a
   single Multi Diff Editor tab — one scroll through everything Claude did.
-- **Dedicated view.** *Claude: Changes to Review* in the Explorer lists every
+- **Dedicated view.** _Claude: Changes to Review_ in the Explorer lists every
   pending file with a count on its header, expandable into its individual hunks —
   each row leading with the code it changes — plus global Keep All / Undo All in
   the view toolbar.
 - **Side-by-side or unified diff.** Opening a file's diff compares the
-  *pre-Claude* baseline against what is on disk now, with the right-hand side
+  _pre-Claude_ baseline against what is on disk now, with the right-hand side
   being the real, editable file.
 
 ### Everywhere
@@ -153,14 +154,14 @@ action throughout:
   was drawn is refused, not applied to whatever now occupies that position. A
   baseline that cannot be established exactly is not offered for review at all.
 - **It warns when your own work is at stake.** The extension cannot tell your
-  lines from Claude's, so a file you have also edited is marked *edited by you*
+  lines from Claude's, so a file you have also edited is marked _edited by you_
   in the changes view, and Undo asks for confirmation naming the file.
 - **It goes on the editor's undo stack.** `Ctrl+Z` / `Cmd+Z` takes an Undo back.
 - **It offers the way back.** Every Undo is confirmed by a notification with a
   **Restore** button that puts the file back exactly as Claude left it — content
-  *and* review state, so it is pending again rather than silently accepted.
+  _and_ review state, so it is pending again rather than silently accepted.
 - **It keeps a copy.** The file's content is snapshotted before every destructive
-  action; run *Claude Keep/Undo: Reveal Recovery Snapshots* to find it. Snapshots
+  action; run _Claude Keep/Undo: Reveal Recovery Snapshots_ to find it. Snapshots
   are kept for 14 days.
 
 ---
@@ -177,12 +178,20 @@ The extension registers `PreToolUse` and `PostToolUse` hooks in
 `Edit|MultiEdit|NotebookEdit|Write` — and `Bash` as well, unless shell-command
 detection is switched off.
 
-- **`PreToolUse`** runs *before* Claude writes. It captures the file's original
+- **`PreToolUse`** runs _before_ Claude writes. It captures the file's original
   content and stages it under `pending/`. It deliberately does **not** publish
   it as a baseline yet — at that instant the file on disk still equals the
   capture, so the extension would see "no difference" and discard it.
-- **`PostToolUse`** runs *after* the write lands. It promotes the staged copy to
+- **`PostToolUse`** runs _after_ the write lands. It promotes the staged copy to
   a real baseline, so the extension always computes a genuine diff.
+
+Claude Code only loads hooks from the project the session was started in. In a
+multi-root window the extension publishes `peers.json` into every folder's
+state directory, and the hook photographs **each** Git repository on a `Bash`
+call, writing into that folder's own queue. A sibling that is not a repository
+is published with `bash: false` and skipped — it still receives Edit/Write
+files that belong under it. Edit/Write of a file in a sibling folder is
+captured there too, rather than dropped for being outside `--root`.
 
 The hook script never blocks a tool call: it swallows every error and always
 exits `0`.
@@ -196,7 +205,7 @@ developer's whole history, Claude Code issues about **twelve Bash calls for ever
 edit-tool call**, so this is not an edge case.
 
 Git is what makes it answerable, for one reason: `git status` costs
-*O(tracked files)* while walking the tree costs *O(tree)*. On a real 69,000-file
+_O(tracked files)_ while walking the tree costs _O(tree)_. On a real 69,000-file
 checkout with 780 tracked files, status answers in 23 ms where the walk needs
 708 — and the walk still would not say what those files used to hold. Git knows
 both.
@@ -209,12 +218,12 @@ both.
 - **After the command**, a second `git status` says what changed, and every
   changed file resolves to exactly one outcome: it did not exist before (the
   baseline is empty and Undo deletes it), we hold a copy taken beforehand, or Git
-  holds its previous content. Anything else is listed as *not reviewable* with
+  holds its previous content. Anything else is listed as _not reviewable_ with
   the reason — never shown against a guess.
 
 Content recovered from Git comes through `git cat-file --filters`, not the raw
 object. In a repository with `text=auto eol=crlf` the stored object has LF line
-endings while the working file has CRLF, so the raw blob is *not* what the file
+endings while the working file has CRLF, so the raw blob is _not_ what the file
 held, and an Undo built from it would rewrite every line in the file.
 
 A command that cannot write to a file — `ls`, `cat`, `grep`, `git status` and a
@@ -223,12 +232,15 @@ it — is skipped without a snapshot. The list is deliberately tiny: a name miss
 from it costs a few milliseconds, while a name wrongly on it costs an undetected
 change.
 
-**This half needs a Git repository.** Outside one — or with Git not on the
-`PATH` — files changed by a shell command are not detected at all. Everything
-Claude changes with its ordinary edit tools is unaffected, hooks and transcript
-alike. The extension checks once per workspace and says so, with the option to
-switch the feature off, rather than leaving you to infer it from an empty review
-queue.
+**This half needs a Git repository, per folder.** A workspace folder that is
+not a repository — a sibling that only holds the `.code-workspace` file and
+workspace-global scripts — is skipped for shell-command snapshots. The hook is
+told `bash: false` for that peer and photographs the others. Edit/Write in the
+non-git folder still work. Git missing from the `PATH`, or a window whose
+*every* folder is not a repository, is the case where shell-command detection
+cannot run at all: the extension says so once, with the option to switch the
+feature off. A mixed window never offers that switch, because it would disable
+the repos that still work.
 
 Two further cases are deliberately not covered. A command run with
 `run_in_background` finishes after the hook has already sampled the filesystem,
@@ -260,7 +272,7 @@ they touch.
 
 **Every transcript under that directory is read, not only the session's own.** A
 subagent — anything launched as a Task, and every agent in a workflow — writes to
-its own file one to three levels down, and its tool calls are *not* mirrored into
+its own file one to three levels down, and its tool calls are _not_ mirrored into
 the parent transcript. On this developer's machine the nested files outnumbered
 the top-level ones thirty to one, and everything they changed used to be
 invisible.
@@ -270,7 +282,7 @@ edits a file, Claude Code copies the original aside under
 `~/.claude/file-history/<session>/` and names that copy in the transcript. The
 copy is a byte-exact image of the file as it was, so the extension reads it
 directly. Retrieval has none of the failure modes of replaying an edit list, and
-it settles a question a replay cannot: when Claude Code records *no* copy, it is
+it settles a question a replay cannot: when Claude Code records _no_ copy, it is
 because the file did not exist — which is how a created file is recognised
 without inferring it from timing.
 
@@ -288,7 +300,7 @@ refuses edits whose `old_string` is not found, you can deny a call at the
 permission prompt, and the same record sometimes appears twice in the file.
 Reverse-applying an edit that never landed produces a baseline that never existed,
 so calls are matched to their `tool_result` and committed only if it reports
-success — and a call whose result never arrives makes the file *not reviewable*
+success — and a call whose result never arrives makes the file _not reviewable_
 rather than reconstructed from the calls that did land.
 
 Every reconstruction is then **proved**: replaying the recorded edits forward over
@@ -304,7 +316,7 @@ extension refuses instead:
   to the same content, so a rename can otherwise rewrite a line you wrote
   yourself;
 - a whole-file **`Write`** whose pre-write state could not be captured, or could
-  not be *proved* to predate the write (the file's own modification time has to be
+  not be _proved_ to predate the write (the file's own modification time has to be
   older than the tool call, or the content read may be Claude's own output).
 
 Files in any of those categories are listed with an explanation rather than shown
@@ -333,10 +345,12 @@ if one already exists, so the transcript path only fills gaps.
 
 ## On-disk state
 
-State lives in **VS Code's per-workspace storage**, not in your repository:
+State lives in **VS Code's global storage**, keyed by the folder path — not by
+the window — so the same repo keeps its review queue when opened alone or in
+another workspace:
 
 ```
-<VS Code workspace storage>/FedeFluork.claude-keep-undo/
+<VS Code globalStorage>/FedeFluork.claude-keep-undo/folders/<folder-key>/
 ├── baselines/<key>        original (pre-Claude) content, published after the edit
 ├── baselines/<key>.json   { path, ts } — makes each baseline self-describing
 ├── pending/<key>          staging area between the Pre and Post hook
@@ -346,6 +360,9 @@ State lives in **VS Code's per-workspace storage**, not in your repository:
 ├── bash/repo.json         the cached Git toplevel, so it is not re-derived per call
 ├── unreviewable/<key>.json a file the hook could not recover, and why; drained and deleted
 ├── ignore.json            the ignore rules, published for the hook process
+├── folder.json            which workspace folder this state directory belongs to
+├── peers.d/<window>.json  this window's folders (one file per VS Code window)
+├── peers.json             union of every live window's registration, for the hook
 └── events.ndjson          size-capped log of hook events
 ```
 
@@ -353,10 +370,30 @@ State lives in **VS Code's per-workspace storage**, not in your repository:
 own sidecar rather than sharing an index file, because the hook process and the
 extension both write here and a shared file would lose updates.
 
+A baseline that this window does not own is **left on disk**, not deleted: another
+window may still be reviewing that file (different folders, or
+`trackOutsideWorkspace` off here and on there). Adding a nested workspace folder
+in the _same_ window moves the recorded original from the outer folder's state
+into the inner one; removing it moves it back. Opening a nested layout in
+_another_ window does not move or delete those copies — merely opening a repo
+must not make Keep/Undo in the first window restore nothing. Each window lists
+reviews that already live in a parent or nested store, filtered by which folder
+owns the file. An explicit Keep or Undo applies to the copy being reviewed,
+including one inherited from a related store, so the decision is visible
+wherever that entry is displayed. Passive browsing still never deletes another
+window's original. Window registrations in `peers.d/` expire if that window
+stops rewriting them, and an empty `peers.d` is "this folder only", not the last
+combined list.
+
+An ignore rule in this window **hides** an existing review rather than deleting
+it. Workspace-scoped `ignore.patterns` in a browsing `.code-workspace` therefore
+no longer wipe another window's queue; a `.keepundoignore` in the repo is still
+shared, but it also only hides. New captures of ignored files are still refused.
+
 `baselines/` and `snapshots/` hold verbatim copies of your source files —
 including whatever secrets those files contain. Keeping them outside the
 repository is deliberate: inside it, they are one `git add -A` away from being
-committed. Run *Claude Keep/Undo: Reveal Recovery Snapshots* to find them.
+committed. Run _Claude Keep/Undo: Reveal Recovery Snapshots_ to find them.
 
 ---
 
@@ -375,7 +412,7 @@ dist/
 ```
 
 An ignored file is **not detected at all**. No gutter bars, no entry in the
-review queue, no *not reviewable* row — and, the part that matters for a `.env`,
+review queue, no _not reviewable_ row — and, the part that matters for a `.env`,
 no copy of its content in the extension's storage. The rules are enforced in the
 Claude Code hook as well as in the extension, so the file is never read in the
 first place: by the time a baseline exists, a verbatim copy is already on disk,
@@ -386,12 +423,12 @@ which is too late for a promise about secrets.
 Four sources, applied in this order. The last rule that matches a path decides
 it, so a later source can re-include with `!` what an earlier one excluded.
 
-| # | Source | Setting |
-|---|---|---|
-| 1 | `.git/` and `node_modules/` | `ignore.useDefaults` (on) |
-| 2 | `.gitignore` and `.git/info/exclude` | `ignore.useGitignore` (off) |
-| 3 | `claudeKeepUndo.ignore.patterns` | always applied |
-| 4 | `.keepundoignore` in the workspace root | `ignore.useIgnoreFile` (on) |
+| #   | Source                                  | Setting                     |
+| --- | --------------------------------------- | --------------------------- |
+| 1   | `.git/` and `node_modules/`             | `ignore.useDefaults` (on)   |
+| 2   | `.gitignore` and `.git/info/exclude`    | `ignore.useGitignore` (off) |
+| 3   | `claudeKeepUndo.ignore.patterns`        | always applied              |
+| 4   | `.keepundoignore` in the workspace root | `ignore.useIgnoreFile` (on) |
 
 The file goes last because it is the project's own statement — committed, shared
 with the team, and the first thing a reader of the repository will look at.
@@ -399,43 +436,44 @@ with the team, and the first thing a reader of the repository will look at.
 set per user or per workspace and travels with Settings Sync.
 
 Only the `.gitignore` at the repository root is read. A per-directory
-`.gitignore` further down the tree carries rules relative to *its* directory, and
+`.gitignore` further down the tree carries rules relative to _its_ directory, and
 applying those from the root would exclude the wrong files.
 
 ### Syntax
 
 The practical subset of gitignore, and nothing else — no regular expressions.
 
-| | |
-|---|---|
-| `build/` | a directory, at any depth |
-| `/build` | anchored at the workspace root |
-| `*.log`, `temp?.txt` | wildcards that do not cross a `/` |
-| `**` | crosses directories: leading (any depth), trailing (everything inside), or between two slashes |
-| `[abc]`, `[a-z]`, `[!a]` | character classes |
-| `!pattern` | re-includes — but not a file whose parent directory is excluded, exactly as in git |
-| `# comment` | and blank lines, ignored |
-| `\#`, `\!` | an escape, for a name that starts with one |
+|                          |                                                                                                |
+| ------------------------ | ---------------------------------------------------------------------------------------------- |
+| `build/`                 | a directory, at any depth                                                                      |
+| `/build`                 | anchored at the workspace root                                                                 |
+| `*.log`, `temp?.txt`     | wildcards that do not cross a `/`                                                              |
+| `**`                     | crosses directories: leading (any depth), trailing (everything inside), or between two slashes |
+| `[abc]`, `[a-z]`, `[!a]` | character classes                                                                              |
+| `!pattern`               | re-includes — but not a file whose parent directory is excluded, exactly as in git             |
+| `# comment`              | and blank lines, ignored                                                                       |
+| `\#`, `\!`               | an escape, for a name that starts with one                                                     |
 
 Matching is case-insensitive on macOS and Windows and case-sensitive on Linux,
 which is the rule the rest of the extension applies to paths.
 
 ### Adding a rule from the UI
 
-Right-click a file in *Claude: Changes to Review* (or in the Source Control
+Right-click a file in _Claude: Changes to Review_ (or in the Source Control
 list) and choose **Stop Reviewing This File**. It writes the anchored rule for
 that exact path into `.keepundoignore`, creating the file from a commented
 template if it does not exist.
 
 If the file has changes waiting, the command says so and asks first, because
-excluding it **keeps** them: the recorded original is deleted along with the
-queue entry, and after that they can no longer be undone. The same thing happens
-— with a notification rather than a dialog — when a rule you add by hand, or one
-that arrives from a colleague, starts matching a file already in the queue.
+excluding it takes the file out of this window's queue. The recorded original
+stays on disk: another window may still be reviewing it, and removing the rule
+can bring the review back. The same thing happens — with a notification rather
+than a dialog — when a rule you add by hand, or one that arrives from a
+colleague, starts matching a file already in the queue.
 
-Removing a rule does not bring anything back. There is nothing to review against
-once the recorded original is gone; the next edit Claude makes to the file starts
-it over.
+Removing a rule can restore a review that was only hidden. If the recorded
+original was never captured (the file was ignored before Claude touched it),
+the next edit Claude makes starts it over.
 
 ---
 
@@ -444,65 +482,65 @@ it over.
 Every surface listed above is a setting, and there are two ways to reach them.
 
 **The setup panel.** Run **Claude Keep/Undo: Settings and Setup** (or click the
-gear in the *Claude: Changes to Review* title bar). It opens a page that shows
+gear in the _Claude: Changes to Review_ title bar). It opens a page that shows
 what is currently detected, offers three presets — **Minimal**, **Recommended**,
 **Everything** — and explains what each surface costs before you turn it on. It
 writes ordinary VS Code settings, so nothing there is private to the panel.
 
-**The Settings editor.** *Extensions › Keep / Undo for Claude Code*, grouped into
-*Review surfaces*, *Pending queue*, *Safety and feedback*, *Detection* and
-*Ignored files*.
+**The Settings editor.** _Extensions › Keep / Undo for Claude Code_, grouped into
+_Review surfaces_, _Pending queue_, _Safety and feedback_, _Detection_ and
+_Ignored files_.
 
 ### Review surfaces
 
-| Setting | Default | Description |
-|---|---|---|
-| `claudeKeepUndo.inlineReview` | `quickDiff` | In-file review: `quickDiff` (gutter bars + Quick Diff widget), `comments` (inline threads), `both`, `off` |
-| `claudeKeepUndo.codeLens` | `diffOnly` | Where the `Keep · Undo` rows appear: `diffOnly`, `always`, `off` |
-| `claudeKeepUndo.codeLensStyle` | `text` | `text` (`Keep`) or `emoji` (`✅ Keep`) |
-| `claudeKeepUndo.quickFixes` | `hunkAndFile` | Quick Fix entries: `hunkAndFile`, `hunkOnly`, `off` — always scoped to the change under the cursor |
-| `claudeKeepUndo.diffMode` | `inline` | `inline` = single unified pane; `sideBySide` = classic split |
-| `claudeKeepUndo.autoOpenDiff` | `false` | Open the diff as soon as Claude modifies a file |
+| Setting                        | Default       | Description                                                                                               |
+| ------------------------------ | ------------- | --------------------------------------------------------------------------------------------------------- |
+| `claudeKeepUndo.inlineReview`  | `quickDiff`   | In-file review: `quickDiff` (gutter bars + Quick Diff widget), `comments` (inline threads), `both`, `off` |
+| `claudeKeepUndo.codeLens`      | `diffOnly`    | Where the `Keep · Undo` rows appear: `diffOnly`, `always`, `off`                                          |
+| `claudeKeepUndo.codeLensStyle` | `text`        | `text` (`Keep`) or `emoji` (`✅ Keep`)                                                                    |
+| `claudeKeepUndo.quickFixes`    | `hunkAndFile` | Quick Fix entries: `hunkAndFile`, `hunkOnly`, `off` — always scoped to the change under the cursor        |
+| `claudeKeepUndo.diffMode`      | `inline`      | `inline` = single unified pane; `sideBySide` = classic split                                              |
+| `claudeKeepUndo.autoOpenDiff`  | `false`       | Open the diff as soon as Claude modifies a file                                                           |
 
 ### Pending queue
 
-| Setting | Default | Description |
-|---|---|---|
-| `claudeKeepUndo.viewBadge` | `true` | Count badge on the changes view header |
-| `claudeKeepUndo.statusBar` | `whenPending` | Status bar entry: `whenPending`, `always`, `off` |
-| `claudeKeepUndo.explorerBadge` | `file` | `file`, `fileAndFolders` (propagates to parents), `off` |
-| `claudeKeepUndo.badge` | `✳` | Explorer badge symbol (max 2 characters) |
-| `claudeKeepUndo.sourceControlList` | `true` | List pending files in the Source Control view |
-| `claudeKeepUndo.explorerContextMenu` | `true` | *Open Diff* in the Explorer right-click menu (hidden when nothing is pending) |
+| Setting                              | Default       | Description                                                                   |
+| ------------------------------------ | ------------- | ----------------------------------------------------------------------------- |
+| `claudeKeepUndo.viewBadge`           | `true`        | Count badge on the changes view header                                        |
+| `claudeKeepUndo.statusBar`           | `whenPending` | Status bar entry: `whenPending`, `always`, `off`                              |
+| `claudeKeepUndo.explorerBadge`       | `file`        | `file`, `fileAndFolders` (propagates to parents), `off`                       |
+| `claudeKeepUndo.badge`               | `✳`           | Explorer badge symbol (max 2 characters)                                      |
+| `claudeKeepUndo.sourceControlList`   | `true`        | List pending files in the Source Control view                                 |
+| `claudeKeepUndo.explorerContextMenu` | `true`        | _Open Diff_ in the Explorer right-click menu (hidden when nothing is pending) |
 
 ### Safety and feedback
 
-| Setting | Default | Description |
-|---|---|---|
-| `claudeKeepUndo.confirmUndo` | `risky` | `risky` (only when your own edits are at stake, and for Undo All), `always`, `never` |
-| `claudeKeepUndo.feedback.undoNotification` | `true` | Notification with a **Restore** button after an Undo |
-| `claudeKeepUndo.feedback.statusBarMessage` | `true` | Brief status bar confirmation after Keep / Undo |
+| Setting                                    | Default | Description                                                                          |
+| ------------------------------------------ | ------- | ------------------------------------------------------------------------------------ |
+| `claudeKeepUndo.confirmUndo`               | `risky` | `risky` (only when your own edits are at stake, and for Undo All), `always`, `never` |
+| `claudeKeepUndo.feedback.undoNotification` | `true`  | Notification with a **Restore** button after an Undo                                 |
+| `claudeKeepUndo.feedback.statusBarMessage` | `true`  | Brief status bar confirmation after Keep / Undo                                      |
 
 ### Detection
 
-| Setting | Default | Description |
-|---|---|---|
-| `claudeKeepUndo.detection.useHooks` | `true` | Detect edits via Claude Code hooks |
-| `claudeKeepUndo.detection.bashChanges` | `created` | How much of what a shell command changed is captured: `created` (files it creates — reads nothing), `recover` (also files it modifies), `off` |
-| `claudeKeepUndo.detection.useTranscript` | `true` | Detect edits via the session transcript |
-| `claudeKeepUndo.promptToInstallHooks` | `true` | Offer to install the hooks on startup |
-| `claudeKeepUndo.trackOutsideWorkspace` | `false` | Also review files outside the open folder |
+| Setting                                  | Default   | Description                                                                                                                                   |
+| ---------------------------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `claudeKeepUndo.detection.useHooks`      | `true`    | Detect edits via Claude Code hooks                                                                                                            |
+| `claudeKeepUndo.detection.bashChanges`   | `created` | How much of what a shell command changed is captured: `created` (files it creates — reads nothing), `recover` (also files it modifies), `off` |
+| `claudeKeepUndo.detection.useTranscript` | `true`    | Detect edits via the session transcript                                                                                                       |
+| `claudeKeepUndo.promptToInstallHooks`    | `true`    | Offer to install the hooks on startup                                                                                                         |
+| `claudeKeepUndo.trackOutsideWorkspace`   | `false`   | Also review files outside the open folder                                                                                                     |
 
 ### Ignored files
 
 See [Ignoring files](#ignoring-files) for the syntax and the precedence.
 
-| Setting | Default | Description |
-|---|---|---|
-| `claudeKeepUndo.ignore.useIgnoreFile` | `true` | Read `.keepundoignore` from the workspace root |
-| `claudeKeepUndo.ignore.patterns` | `[]` | Extra patterns, kept in your settings rather than in the project |
-| `claudeKeepUndo.ignore.useDefaults` | `true` | Ignore `.git/` and `node_modules/` |
-| `claudeKeepUndo.ignore.useGitignore` | `false` | Also apply the repository's own `.gitignore` |
+| Setting                               | Default | Description                                                      |
+| ------------------------------------- | ------- | ---------------------------------------------------------------- |
+| `claudeKeepUndo.ignore.useIgnoreFile` | `true`  | Read `.keepundoignore` from the workspace root                   |
+| `claudeKeepUndo.ignore.patterns`      | `[]`    | Extra patterns, kept in your settings rather than in the project |
+| `claudeKeepUndo.ignore.useDefaults`   | `true`  | Ignore `.git/` and `node_modules/`                               |
+| `claudeKeepUndo.ignore.useGitignore`  | `false` | Also apply the repository's own `.gitignore`                     |
 
 The badge color is themeable via `claudeKeepUndo.modifiedResourceForeground` in
 `workbench.colorCustomizations`.
@@ -511,26 +549,28 @@ The badge color is themeable via `claudeKeepUndo.modifiedResourceForeground` in
 
 All commands live under the **Claude Keep/Undo** category.
 
-| Command | Where | Keys |
-|---|---|---|
-| Open Diff of Claude's Changes | Palette, Explorer context menu, changes view, Source Control | |
-| Review All Claude Changes (Multi-File Diff) | Palette, changes view toolbar, Source Control title bar, status bar | |
-| Keep / Undo This Change | Quick Diff widget toolbar, inline comment thread, Quick Fix menu, per-hunk CodeLens, changes view | |
-| Keep / Undo the Change at the Cursor | Palette | `Ctrl+Alt+K` / `Ctrl+Alt+U` |
-| Go to Next / Previous Claude Change | Palette | `Ctrl+Alt+N` / `Ctrl+Alt+P` |
-| Keep / Undo Claude's Change on This Line | Line-number context menu | |
-| Keep / Undo All Changes in This File | Editor title bar, Source Control, changes view, Quick Fix menu, palette | |
-| Keep / Undo All of Claude's Changes | Changes view toolbar, Source Control title bar, palette | |
-| Restore the Last Undo | Undo notification, changes view menu, palette | |
-| Settings and Setup | Changes view title bar, palette | |
-| Open the Getting Started Walkthrough | Palette | |
-| Install Claude Code Hooks in This Project | Palette, unreviewable rows | |
-| Refresh Change Status | Changes view toolbar, palette | |
-| Reveal Recovery Snapshots | Changes view menu, palette | |
-| Edit Ignored Files (.keepundoignore) | Changes view menu, settings panel, palette | |
-| Stop Reviewing This File | Changes view context menu, Source Control, palette | |
+| Command                                     | Where                                                                                             | Keys                        |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------- | --------------------------- |
+| Open Diff of Claude's Changes               | Palette, Explorer context menu, changes view, Source Control                                      |                             |
+| Review All Claude Changes (Multi-File Diff) | Palette, changes view toolbar, Source Control title bar, status bar                               |                             |
+| Keep / Undo This Change                     | Quick Diff widget toolbar, inline comment thread, Quick Fix menu, per-hunk CodeLens, changes view |                             |
+| Keep / Undo the Change at the Cursor        | Palette                                                                                           | `Ctrl+Alt+K` / `Ctrl+Alt+U` |
+| Go to Next / Previous Claude Change         | Palette                                                                                           | `Ctrl+Alt+N` / `Ctrl+Alt+P` |
+| Keep / Undo Claude's Change on This Line    | Line-number context menu                                                                          |                             |
+| Keep / Undo All Changes in This File        | Editor title bar, Source Control, changes view, Quick Fix menu, palette                           |                             |
+| Keep / Undo All of Claude's Changes         | Changes view toolbar, Source Control title bar, palette                                           |                             |
+| Keep / Undo All Changes in This Folder      | Multi-root changes view folder rows                                                               |                             |
+| Review This Folder's Claude Changes         | Multi-root changes view folder rows                                                               |                             |
+| Restore the Last Undo                       | Undo notification, changes view menu, palette                                                     |                             |
+| Settings and Setup                          | Changes view title bar, palette                                                                   |                             |
+| Open the Getting Started Walkthrough        | Palette                                                                                           |                             |
+| Install Claude Code Hooks in This Project   | Palette, unreviewable rows                                                                        |                             |
+| Refresh Change Status                       | Changes view toolbar, palette                                                                     |                             |
+| Reveal Recovery Snapshots                   | Changes view menu, palette                                                                        |                             |
+| Edit Ignored Files (.keepundoignore)        | Changes view menu, settings panel, palette                                                        |                             |
+| Stop Reviewing This File                    | Changes view context menu, Source Control, palette                                                |                             |
 
-*Undo All* asks for confirmation before rewriting files. On macOS the four
+_Undo All_ asks for confirmation before rewriting files. On macOS the four
 keyboard shortcuts use `Cmd` instead of `Ctrl`, and all of them apply only while
 the active editor holds a file Claude has changed.
 
@@ -539,7 +579,7 @@ the active editor holds a file Claude has changed.
 ## Known limitations
 
 These are honest constraints of VS Code's **stable** extension API. Anything
-that requires a *proposed* API is deliberately not used, because extensions that
+that requires a _proposed_ API is deliberately not used, because extensions that
 enable proposed APIs [cannot be published to the
 Marketplace](https://code.visualstudio.com/api/advanced-topics/using-proposed-api).
 
@@ -553,12 +593,12 @@ Marketplace](https://code.visualstudio.com/api/advanced-topics/using-proposed-ap
   visible Quick Diff provider. In a Git repository, Git compares against `HEAD`
   and this extension compares against the pre-Claude baseline — usually the same
   lines, so you may see both. Hide either one from the Source Control view's
-  *Toggle Quick Diff Visibility* action, or set
+  _Toggle Quick Diff Visibility_ action, or set
   `claudeKeepUndo.inlineReview` to `comments` or `off`.
   The Quick Diff widget shows one provider at a time; the **Keep** / **Undo**
-  buttons appear when the widget is showing *Claude Changes*.
+  buttons appear when the widget is showing _Claude Changes_.
 - **A second Source Control provider.** Registering the Quick Diff provider means
-  a *Claude Changes* entry appears in the Source Control view alongside Git. It
+  a _Claude Changes_ entry appears in the Source Control view alongside Git. It
   is not a real SCM — there is no commit box — and it doubles as the pending-file
   list. `claudeKeepUndo.sourceControlList` empties that list; the registration
   itself has to stay for as long as the gutter bars are wanted, because they come
@@ -581,8 +621,8 @@ Marketplace](https://code.visualstudio.com/api/advanced-topics/using-proposed-ap
   file open in both a diff tab and an ordinary tab shows the rows in both: the
   provider is given the document and never learns which editor is asking.
 - **Transcript-only coverage is partial by design.** Without the hooks, an edit
-  whose original state cannot be reconstructed *exactly* is listed as
-  *not reviewable* rather than shown against a guessed baseline — including every
+  whose original state cannot be reconstructed _exactly_ is listed as
+  _not reviewable_ rather than shown against a guessed baseline — including every
   `replace_all` edit, which is not reversible from the transcript at all. Install
   the hooks for full coverage.
 - **User edits are detected per file, not per line.** The extension knows a file
@@ -595,7 +635,7 @@ Marketplace](https://code.visualstudio.com/api/advanced-topics/using-proposed-ap
   original is kept rather than deleted.
 - **Line endings are reviewed, not diffed.** The diff itself ignores line
   terminators, which is what keeps a Keep or an Undo from rewriting every line in a
-  CRLF file. A rewrite that changes *only* the terminators — the ordinary result of
+  CRLF file. A rewrite that changes _only_ the terminators — the ordinary result of
   Claude's `Write` tool touching a CRLF file — therefore has no per-line rendering:
   it is listed as **line endings changed**, and Undo restores the original bytes.
   Restoring such a file bypasses the editor, so that particular Undo is not on the
@@ -610,17 +650,16 @@ Marketplace](https://code.visualstudio.com/api/advanced-topics/using-proposed-ap
   (VS Code refuses to write one that has syntax errors), you are told which key is
   affected. Still: if you disable or uninstall the extension while a diff is open,
   check those two settings.
-- **Single-root only.** The first workspace folder is handled — the usual
-  Claude Code layout.
-- **`claudeKeepUndo.trackOutsideWorkspace` only reaches the transcript channel.**
-  The hook command records the workspace root when it is installed, so files
-  outside the open folder are filtered out there regardless of the setting. Turning
-  it on and reinstalling the hooks is the workaround.
-- **Case-insensitive paths are matched by spelling in memory.** On Windows and
-  macOS the on-disk state folds case, but the in-memory review state does not, so a
-  path VS Code and Claude Code spell with different casing can be tracked without
-  the editor surfaces recognising it. Not reproducible on a normal macOS setup;
-  Windows drive-letter casing is the case to watch.
+- **`claudeKeepUndo.trackOutsideWorkspace` only reaches files under no workspace
+  folder.** Sibling folders in the same window are captured by the hook via
+  `peers.json`. Files outside every open folder are still filtered out of the
+  hook (so a `.env` in a directory that is not in the workspace is never
+  copied); the transcript channel honours the setting for those.
+- **Path case is folded in memory the same way it is on disk.** On Windows the
+  hook (git's `D:\...`) and the editor (`uri.fsPath`, often `d:\...`) routinely
+  disagree on drive-letter casing. Keep/Undo look up the file by the folded
+  path, so a shell-created file in the queue can be undone from the editor that
+  opened it. Linux is still case-sensitive.
 
 ---
 
@@ -633,7 +672,7 @@ npm install
 npm run compile     # or: npm run watch
 ```
 
-Press **F5** (launch configuration *Run Extension*) to open an Extension
+Press **F5** (launch configuration _Run Extension_) to open an Extension
 Development Host, then open a project where Claude Code is running.
 
 ### Tests
@@ -653,7 +692,7 @@ rather than guessed at — the hook settings merge and registration
 classification, the file IO helpers, the manifest contributions, the
 transcript reader driven end to end against real `.jsonl` files, and the
 multi-window behaviour of the temporary `diffEditor.*` overrides. The last two run
-against a stubbed `vscode`, because every failure in the layout group was *between*
+against a stubbed `vscode`, because every failure in the layout group was _between_
 windows and the reader only resolves inside the extension host. No test framework
 dependency, just `node:test`. The integration tests
 download VS Code on first run and need `@vscode/test-electron` ≥ 3.1.0 (VS Code
@@ -671,36 +710,39 @@ npm run package     # npx @vscode/vsce package
 
 ### Project layout
 
-| Path | Role |
-|---|---|
-| `src/extension.ts` | Activation, provider/command registration, wiring |
-| `src/changeStore.ts` | State (baselines, pending hunks), recompute, keep/undo actions |
-| `src/diff.ts` | Dependency-free LCS line-diff engine, plus `LineChange` ↔ hunk mapping |
-| `src/util.ts` | Path hashing, project-dir encoding, safe file IO |
-| `src/ignore.ts` | Pure `.gitignore`-style matcher, shared with the hook process |
-| `src/ignoreConfig.ts` | Merges the ignore sources, watches them, publishes them for the hook |
-| `src/detection/hookInstaller.ts` | Install/repair hooks, with settings safety |
-| `src/detection/hookSettings.ts` | Pure hook-config merge and state classification |
-| `src/detection/keepUndoWatcher.ts` | Watches `<state>/baselines/**` (hook channel) |
-| `src/detection/transcriptOffsets.ts` | Decides where to start reading each transcript |
-| `src/detection/transcriptWatcher.ts` | Tails the transcripts, reconstructs baselines |
-| `src/detection/transcriptEvents.ts` | Pure: which tool calls are believed, and when |
-| `src/detection/reconstruct.ts` | Pure, verified baseline reconstruction |
-| `src/detection/fileHistory.ts` | Pure: reading Claude Code's own pre-edit copies |
-| `src/detection/bashSnapshot.ts` | Pure: reading git status, and what a shell command changed |
-| `src/ui/quickDiff.ts` | Source Control + Quick Diff provider (gutter bars, inline widget, pending list) |
-| `src/ui/commentReview.ts` | Optional inline comment threads with Keep/Undo |
-| `src/ui/codeActions.ts` | Keep/Undo as Quick Fixes on the hunk under the cursor |
-| `src/ui/diffView.ts` | `claude-baseline:` content provider + diff opening |
-| `src/ui/fileDecorations.ts` | Explorer badge |
-| `src/ui/codeLens.ts` | Per-hunk and per-file Keep/Undo CodeLens, plus prev/next on the current hunk |
-| `src/ui/format.ts` | Shared hunk formatting helpers |
-| `src/test/unit/**` | Pure-logic tests (`node:test`) |
-| `src/test/integration/**` | End-to-end tests in a real VS Code |
-| `src/ui/diffLayout.ts` | Forces inline diff + `diffEditor.codeLens`, avoids layout flash |
-| `src/ui/changesView.ts` | File → hunk tree view with inline actions |
-| `hooks/keepundo-hook.mjs` | Hook script executed by Claude Code |
-| `scripts/check-encoding.mjs` | Fails the build on a NUL byte in a source file |
+| Path                                 | Role                                                                            |
+| ------------------------------------ | ------------------------------------------------------------------------------- |
+| `src/extension.ts`                   | Activation, provider/command registration, wiring                               |
+| `src/changeStore.ts`                 | State (baselines, pending hunks), recompute, keep/undo actions                  |
+| `src/reviewHub.ts`                   | One review store per workspace folder, presented to the UI as one              |
+| `src/diff.ts`                        | Dependency-free LCS line-diff engine, plus `LineChange` ↔ hunk mapping          |
+| `src/util.ts`                        | Path hashing, project-dir encoding, safe file IO                                |
+| `src/ignore.ts`                      | Pure `.gitignore`-style matcher, shared with the hook process                   |
+| `src/ignoreConfig.ts`                | Merges the ignore sources, watches them, publishes them for the hook            |
+| `src/detection/hookInstaller.ts`     | Install/repair hooks, with settings safety                                      |
+| `src/detection/hookSettings.ts`      | Pure hook-config merge and state classification                                 |
+| `src/detection/keepUndoWatcher.ts`   | Watches `<state>/baselines/**` (hook channel)                                   |
+| `src/detection/transcriptOffsets.ts` | Decides where to start reading each transcript                                  |
+| `src/detection/transcriptWatcher.ts` | Tails the transcripts, reconstructs baselines                                   |
+| `src/detection/transcriptEvents.ts`  | Pure: which tool calls are believed, and when                                   |
+| `src/detection/reconstruct.ts`       | Pure, verified baseline reconstruction                                          |
+| `src/detection/fileHistory.ts`       | Pure: reading Claude Code's own pre-edit copies                                 |
+| `src/detection/bashAvailability.ts`  | Pure: skip a non-git sibling, or the window cannot photograph Bash              |
+| `src/detection/bashSnapshot.ts`      | Pure: reading git status, and what a shell command changed                      |
+| `src/ui/quickDiff.ts`                | Source Control + Quick Diff provider (gutter bars, inline widget, pending list) |
+| `src/ui/commentReview.ts`            | Optional inline comment threads with Keep/Undo                                  |
+| `src/ui/codeActions.ts`              | Keep/Undo as Quick Fixes on the hunk under the cursor                           |
+| `src/ui/diffView.ts`                 | `claude-baseline:` / `claude-current:` content providers + diff opening         |
+| `src/ui/fileDecorations.ts`          | Explorer badge                                                                  |
+| `src/ui/codeLens.ts`                 | Per-hunk and per-file Keep/Undo CodeLens, plus prev/next on the current hunk    |
+| `src/ui/hunkNav.ts`                  | Pure: which hunk the caret is on, and its neighbours                           |
+| `src/ui/format.ts`                   | Shared hunk formatting helpers                                                  |
+| `src/test/unit/**`                   | Pure-logic tests (`node:test`)                                                  |
+| `src/test/integration/**`            | End-to-end tests in a real VS Code                                              |
+| `src/ui/diffLayout.ts`               | Forces inline diff + `diffEditor.codeLens`, avoids layout flash                 |
+| `src/ui/changesView.ts`              | File → hunk tree view with inline actions                                       |
+| `hooks/keepundo-hook.mjs`            | Hook script executed by Claude Code                                             |
+| `scripts/check-encoding.mjs`         | Fails the build on a NUL byte in a source file                                  |
 
 ---
 
@@ -709,7 +751,8 @@ npm run package     # npx @vscode/vsce package
 The extension does not make network requests, collect telemetry, or send
 anything anywhere. It reads your workspace files and your local Claude Code
 session transcripts, and writes baselines and recovery snapshots into VS
-Code's per-workspace storage — outside your repository, never inside it.
+Code's global storage (`globalStorage/folders/<hash>`), keyed by folder path
+— outside your repository, never inside it.
 All of it stays on your machine.
 
 A file matched by [an ignore rule](#ignoring-files) is not read at all: the rule

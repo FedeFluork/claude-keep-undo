@@ -8,6 +8,11 @@ import {
   useHooks,
 } from "../settings";
 import { atomicWrite, readFileResult, removeFile } from "../util";
+import {
+  BashFolderProbe,
+  BashUnavailable,
+  planBashDetection,
+} from "./bashAvailability";
 import { BashMode } from "./bashSnapshot";
 import {
   hasOurHooks,
@@ -20,6 +25,8 @@ import {
   stripHooks,
 } from "./hookSettings";
 
+export type { BashFolderProbe, BashUnavailable } from "./bashAvailability";
+export { planBashDetection } from "./bashAvailability";
 export { HookState } from "./hookSettings";
 
 /**
@@ -379,15 +386,6 @@ export function repairHooksIfStale(
 }
 
 /**
- * Why shell-command detection cannot work here, or undefined when it can.
- *
- * Kept separate from the hook registration because it is a different kind of
- * failure: the hooks may be installed perfectly and still capture nothing,
- * because what a shell command changed is worked out from Git.
- */
-export type BashUnavailable = "no-git" | "not-a-repository";
-
-/**
  * Ask, once, whether shell-command detection can actually run here.
  *
  * Resolved by running `git rev-parse` rather than by looking for a `.git`
@@ -426,31 +424,54 @@ export function probeBashDetection(
 }
 
 /**
- * Say once, per workspace, that files changed by a shell command will not be
- * detected here.
+ * Tell the user when shell-command detection cannot run — and only then.
  *
- * Without this the extension is silent about it, and silence is exactly what it
- * promises not to do: a file Claude changed is either reviewable or listed with
- * a reason, never simply absent. The diagnostic log said so already, but nobody
- * reads that.
+ * A non-git sibling is skipped, not a reason to disable the feature for the
+ * whole window. "Turn this off" writes `detection.bashChanges` at workspace
+ * scope, so it is offered only when *no* folder can photograph a shell command.
+ * Mixed windows get an information toast and the hook is told to skip that peer.
  */
 export async function warnIfBashDetectionUnavailable(
-  workspaceRoot: string,
+  folders: readonly BashFolderProbe[],
   bash: BashMode,
   log: (msg: string) => void,
   dismissals?: vscode.Memento
 ): Promise<void> {
-  if (bash === "off" || !useHooks()) {
+  if (bash === "off" || !useHooks() || folders.length === 0) {
     return; // the user asked for none of this
   }
-  const problem = await probeBashDetection(workspaceRoot);
-  if (!problem) {
+  const plan = planBashDetection(folders);
+  if (plan.kind === "all-available") {
+    return;
+  }
+  if (plan.kind === "skip-peers") {
+    const names = plan.skipped.map((folder) => folder.name).join(", ");
+    log(
+      `skipping shell-command detection in ${names}: not a Git repository. Shell changes in the other folders are still detected.`
+    );
+    const dismissKey = "dismissedBashSkipPeerWarning";
+    if (dismissals?.get<boolean>(dismissKey)) {
+      return;
+    }
+    const message =
+      plan.skipped.length === 1
+        ? `Claude Keep/Undo: '${plan.skipped[0].name}' is not a Git repository, so files changed by a shell command there are skipped. Detection in the other folders is unchanged.`
+        : `Claude Keep/Undo: ${plan.skipped.length} folders are not Git repositories, so shell-command changes there are skipped. Detection in the other folders is unchanged.`;
+    const choice = await vscode.window.showInformationMessage(
+      message,
+      "Don't warn again"
+    );
+    if (choice === "Don't warn again") {
+      await dismissals?.update(dismissKey, true);
+    }
     return;
   }
   const detail =
-    problem === "no-git"
+    plan.problem === "no-git"
       ? "Git is not available on the PATH"
-      : "this folder is not a Git repository";
+      : folders.length === 1
+        ? "this folder is not a Git repository"
+        : "none of these folders is a Git repository";
   log(
     `files changed by a shell command will not be detected: ${detail}. Everything Claude changes with its edit tools is unaffected.`
   );
@@ -540,32 +561,37 @@ async function verifyHookRuns(
 }
 
 /**
- * On activation, offer to install the hooks if they are missing. Honors the
- * "promptToInstallHooks" setting and remembers a per-workspace dismissal.
+ * On activation, offer to install the hooks if they are missing in any of the
+ * given projects. Honors the "promptToInstallHooks" setting and remembers a
+ * per-workspace dismissal.
  */
 export async function maybePromptInstall(
   context: vscode.ExtensionContext,
-  workspaceRoot: string,
-  stateDir: string
+  targets: { workspaceRoot: string; stateDir: string }[]
 ): Promise<void> {
-  if (!promptToInstallHooks() || !useHooks()) {
+  if (!promptToInstallHooks() || !useHooks() || targets.length === 0) {
     return;
   }
   // Guarded like every other read of the registration: this one is awaited from
   // activation with no catch, so a throw here would surface as an unhandled
   // rejection rather than as a missing prompt.
-  let state: HookState;
-  try {
-    state = hooksState(
-      workspaceRoot,
-      context.extensionPath,
-      stateDir,
-      bashChanges()
-    );
-  } catch {
-    return;
+  const missing: { workspaceRoot: string; stateDir: string }[] = [];
+  for (const target of targets) {
+    try {
+      const state = hooksState(
+        target.workspaceRoot,
+        context.extensionPath,
+        target.stateDir,
+        bashChanges()
+      );
+      if (state === "missing") {
+        missing.push(target);
+      }
+    } catch {
+      continue;
+    }
   }
-  if (state !== "missing") {
+  if (missing.length === 0) {
     return;
   }
   const dismissKey = "dismissedHookPrompt";
@@ -573,14 +599,61 @@ export async function maybePromptInstall(
     return;
   }
 
+  const message =
+    missing.length === 1
+      ? "Keep / Undo for Claude Code: install the Claude Code hooks in this project? They give exact baselines; without them some of Claude's edits cannot be reconstructed and are not offered for review."
+      : `Keep / Undo for Claude Code: install the Claude Code hooks in ${missing.length} projects? They give exact baselines; without them some of Claude's edits cannot be reconstructed and are not offered for review.`;
+
   const choice = await vscode.window.showInformationMessage(
-    "Keep / Undo for Claude Code: install the Claude Code hooks in this project? They give exact baselines; without them some of Claude's edits cannot be reconstructed and are not offered for review.",
+    message,
     "Install",
     "Transcript only",
     "Don't ask again"
   );
   if (choice === "Install") {
-    installHooksInteractive(workspaceRoot, context.extensionPath, stateDir);
+    if (missing.length === 1) {
+      installHooksInteractive(
+        missing[0].workspaceRoot,
+        context.extensionPath,
+        missing[0].stateDir
+      );
+    } else {
+      let failed: Extract<InstallResult, { ok: false }> | undefined;
+      let ok = 0;
+      for (const target of missing) {
+        const result = installHooks(
+          target.workspaceRoot,
+          context.extensionPath,
+          target.stateDir,
+          bashChanges()
+        );
+        if (result.ok) {
+          ok++;
+        } else {
+          failed = result;
+        }
+      }
+      if (ok === missing.length) {
+        void vscode.window.showInformationMessage(
+          `Claude Code hooks installed in ${missing.length} projects. Claude's next edits will be detected in real time.`
+        );
+      } else if (failed) {
+        void vscode.window
+          .showErrorMessage(
+            `Could not install the Claude Code hooks in ${
+              missing.length - ok
+            } of ${missing.length} projects: ${failed.reason}.`,
+            "Open settings file"
+          )
+          .then((open) => {
+            if (open === "Open settings file") {
+              void vscode.window.showTextDocument(
+                vscode.Uri.file(failed.settingsFile)
+              );
+            }
+          });
+      }
+    }
   } else if (choice === "Don't ask again" || choice === "Transcript only") {
     await context.workspaceState.update(dismissKey, true);
   }

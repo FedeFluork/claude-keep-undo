@@ -51,5 +51,9 @@ showcase.gif
 
 # Local dev/runtime state — must never ship in the package
 .claude/**
+# Local History (and similar) snapshots of this workspace. They are not part of
+# the extension; packing them publishes copies of gitignore and other files.
+.history/**
+**/.history/**
 # The bare name matches only the root copy; macOS leaves one in every directory.
 **/.DS_Store

@@ -1,6 +1,6 @@
 import * as path from "path";
 import * as vscode from "vscode";
-import { ChangeStore, UndoSnapshot } from "../changeStore";
+import { ReviewStore, UndoSnapshot } from "../changeStore";
 import { statusBarMessage, undoNotification } from "../settings";
 import { pluralFiles } from "./format";
 
@@ -49,7 +49,7 @@ export class Feedback implements vscode.Disposable {
   private expiry: NodeJS.Timeout | undefined;
   private readonly listener: vscode.Disposable;
 
-  constructor(private readonly store: ChangeStore) {
+  constructor(private readonly store: ReviewStore) {
     // Invalidate the restore point once a file it covers moves again — Claude
     // editing it, the user typing in it, another review action. Re-applying then
     // would overwrite content the record knows nothing about.

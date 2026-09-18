@@ -127,8 +127,10 @@ Two complementary detection mechanisms, both on by default:
   cannot be established exactly the file is listed as *not reviewable* instead of
   shown against a guessed baseline, so coverage is partial by design.
 
-Baselines and recovery snapshots go into VS Code's per-workspace storage, never
-into your repository. [How change detection works →](REFERENCE.md#how-change-detection-works)
+Baselines and recovery snapshots go into VS Code's global storage
+(`globalStorage/folders/<hash>`), keyed by folder path — never into your
+repository. The same repo opened alone or in another window keeps the same
+review queue. [How change detection works →](REFERENCE.md#how-change-detection-works)
 
 ## Known limitations
 
@@ -145,14 +147,17 @@ reference, and each one is a constraint of VS Code's **stable** extension API:
   repository**. Outside one, or with Git unavailable, those changes are not
   detected — the extension says so once instead of leaving the queue quietly
   empty. Claude's ordinary edit tools are unaffected either way.
-- UTF-8 text only, single-root workspaces only.
+- UTF-8 text only. Multi-root workspaces are supported: each folder has its
+  own review queue, and state is keyed by folder so the same repo in another
+  window keeps its pending reviews.
 
 ## Privacy
 
 No network requests, no telemetry, nothing sent anywhere. The extension reads
 your workspace files and your local Claude Code session transcripts, and writes
-baselines and recovery snapshots into VS Code's per-workspace storage — outside
-your repository. All of it stays on your machine. Anything listed in
+baselines and recovery snapshots into VS Code's global storage
+(`globalStorage/folders/<hash>`), keyed by folder path — outside your
+repository. All of it stays on your machine. Anything listed in
 [`.keepundoignore`](REFERENCE.md#ignoring-files) is not read at all.
 
 ## Development

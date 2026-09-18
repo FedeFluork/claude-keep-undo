@@ -68,6 +68,7 @@ report.*.json
 .vscode/settings.json
 .vscode/*.local.json
 .idea/
+.history/
 *.iml
 *.swp
 *.swo

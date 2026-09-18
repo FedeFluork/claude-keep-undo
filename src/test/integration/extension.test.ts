@@ -150,6 +150,9 @@ describe("Keep / Undo for Claude Code", () => {
       "claudeKeepUndo.undoFile",
       "claudeKeepUndo.keepAll",
       "claudeKeepUndo.undoAll",
+      "claudeKeepUndo.keepFolder",
+      "claudeKeepUndo.undoFolder",
+      "claudeKeepUndo.openFolderChanges",
       "claudeKeepUndo.keepAtCursor",
       "claudeKeepUndo.undoAtCursor",
       "claudeKeepUndo.nextChange",
@@ -476,6 +479,33 @@ describe("Keep / Undo for Claude Code", () => {
       );
     } finally {
       fs.rmSync(outside, { force: true });
+    }
+  });
+
+  it("does not delete an out-of-workspace baseline on refresh", async () => {
+    // Folder-keyed state is shared across windows. A window that does not own
+    // this path (different folders, or trackOutsideWorkspace off) must hide it,
+    // not wipe the only pre-Claude copy.
+    const outside = path.join(
+      os.tmpdir(),
+      `keepundo-foreign-${Date.now()}.txt`
+    );
+    fs.writeFileSync(outside, "now\n");
+    const content = seedBaseline(outside, "before\n");
+    try {
+      await vscode.commands.executeCommand("claudeKeepUndo.refresh");
+      await wait(200);
+      assert.equal(api.store.isTracked(outside), false);
+      assert.equal(
+        fileExists(content),
+        true,
+        "another window may still own this review"
+      );
+      assert.equal(fileExists(sidecarPath(content)), true);
+    } finally {
+      fs.rmSync(outside, { force: true });
+      fs.rmSync(content, { force: true });
+      fs.rmSync(sidecarPath(content), { force: true });
     }
   });
 
@@ -883,6 +913,38 @@ describe("Keep / Undo for Claude Code", () => {
     assert.equal(doc.getText(), "old\n");
   });
 
+  it("drops a file Claude created once the file is gone", async () => {
+    // Claude created it (empty baseline), then deleted it — back to the
+    // pre-Claude state. The queue must not keep listing a path that opens
+    // "file was not found".
+    const file = makeFile("it-created-then-gone.txt", "brand new\n");
+    seedBaseline(file, "", /*created*/ true);
+    await vscode.commands.executeCommand("claudeKeepUndo.refresh");
+    assert.equal(api.store.isTracked(file), true);
+
+    fs.rmSync(file, { force: true });
+    await vscode.commands.executeCommand("claudeKeepUndo.refresh");
+    assert.equal(api.store.isTracked(file), false);
+  });
+
+  it("keeps a deleted pre-existing file reviewable against an empty right-hand side", async () => {
+    const file = makeFile("it-deleted.txt", "gone\n");
+    seedBaseline(file, "original\n");
+    await vscode.commands.executeCommand("claudeKeepUndo.refresh");
+    assert.equal(api.store.get(file)?.missing, false);
+
+    fs.rmSync(file, { force: true });
+    await vscode.commands.executeCommand("claudeKeepUndo.refresh");
+    const tracked = api.store.get(file);
+    assert.ok(tracked, "Undo can still restore it");
+    assert.equal(tracked.missing, true);
+
+    const doc = await vscode.workspace.openTextDocument(
+      vscode.Uri.file(file).with({ scheme: "claude-current" })
+    );
+    assert.equal(doc.getText(), "");
+  });
+
   describe("ignored files", () => {
     /** Poll until a condition holds, so a watcher's latency is not a flake. */
     async function until(
@@ -923,9 +985,9 @@ describe("Keep / Undo for Claude Code", () => {
       );
     });
 
-    it("drops a baseline that a rule reaches after it was written", async () => {
+    it("hides a baseline that a rule reaches after it was written", async () => {
       // The hook may have captured the file before the rule existed, or with an
-      // older descriptor. The sweep is what makes the rule retroactive.
+      // older descriptor. The sweep is what takes it out of this window's queue.
       const file = makeFile("it-generated.ts", "export const a = 2;\n");
       seedBaseline(file, "export const a = 1;\n");
       await vscode.commands.executeCommand("claudeKeepUndo.refresh");
@@ -941,8 +1003,8 @@ describe("Keep / Undo for Claude Code", () => {
       );
       assert.equal(
         fileExists(path.join(baselinesDir(stateDir), pathKey(file))),
-        false,
-        "its recorded original must be deleted, not merely hidden"
+        true,
+        "its recorded original stays on disk for another window, or if the rule is removed"
       );
     });
 

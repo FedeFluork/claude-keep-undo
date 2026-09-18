@@ -7,6 +7,83 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added — multi-root workspaces
+
+- **Each workspace folder has its own review queue.** Hooks, ignore rules, the
+  transcript watcher and the Source Control entry are per folder, so two repos
+  in one window no longer share a single queue.
+- **Persistent state is keyed by folder path**, under
+  `globalStorage/folders/<hash>` — not by the VS Code workspace. Opening the
+  same repo on its own, or in another window, finds the same pending reviews.
+  Existing per-workspace storage is migrated once when the new location is
+  empty.
+- **Sibling folders are never treated as “outside the workspace.”** A file in
+  the other repo in this window belongs to that repo.
+
+### Changed
+
+- **`trackOutsideWorkspace` is mostly obsolete.** Multi-root support replaces
+  the setting for sibling (and nested) repositories: add the folder to the
+  window instead. The setting is kept for the leftover case — transcript
+  detection of Edit/Write on a file that sits under _no_ workspace folder
+  (Claude's own settings, a scratch file). The hooks still never copy those.
+- **Nested workspace folders:** the deepest root owns the file, so a repo
+  opened inside another is not double-tracked. In the same window, existing
+  reviews move with ownership rather than being dropped. A second window that
+  only opens the nested layout does not take those originals; it lists them,
+  and Keep there resolves the copy being reviewed.
+- **The changes view groups by folder** when more than one root is open.
+  Keep All / Undo All / Review on a folder row (or on that folder’s Source
+  Control entry) apply only there.
+- **A Claude session started in one folder captures the others too.** The hook
+  photographs every workspace repo on a shell command, and routes Edit/Write
+  files into the owning folder's queue — so a `printf > sibling/file` shows up
+  under that sibling, not only the session's own repo. Each window registers
+  its own folder list (`peers.d/`); the hook reads the combined list, so
+  opening one of those repos alone in a second window no longer disables
+  capture of the others.
+- **A sibling that is not a Git repository is skipped, not fatal.** A folder
+  that only holds the `.code-workspace` file and workspace-global scripts still
+  owns Edit/Write under it, but the Bash hook does not photograph it. The other
+  folders keep shell-command detection. The warning that used to read as
+  “this window cannot detect shell changes” — and whose **Turn this off**
+  disabled `detection.bashChanges` for every folder — is now an information
+  toast for that peer only, and **Turn this off** is offered only when no
+  folder can run Git.
+- **A file Claude created and then deleted leaves the queue.** Shell `rm` never
+  opened an editor, so the review list kept a stale row whose click opened
+  “file was not found”. Tracked files are recomputed when they disappear on
+  disk. A created file that is gone is back to the pre-Claude state and is
+  dropped. A pre-existing file Claude deleted stays listed as *deleted*; Keep
+  forgets it, Undo restores it, and the diff opens against an empty virtual
+  document instead of a missing `file:` URI.
+- **Pending reviews survive a window that does not own them.** Opening the same
+  folder with different siblings, or with `trackOutsideWorkspace` off, no longer
+  deletes baselines that are out of this window's scope — they stay on disk and
+  reappear when a window that owns them loads. Adding or removing a nested
+  folder in the _same_ window _moves_ the recorded original into the folder
+  that owns the file. Opening a nested layout in _another_ window does not
+  move or delete those originals — a window that merely opens a repo must not
+  make other windows lose Keep/Undo. Nested windows still list reviews that
+  live in a parent store, and outer-only windows still list reviews that live
+  in a nested store. An explicit Keep or Undo applies to the copy being
+  reviewed, so the decision sticks wherever that entry is shown. Ownership
+  includes the folder itself, so a nested store does not bounce its own files
+  back to the outer one.
+- **Ignore rules hide existing reviews rather than delete them.** A browsing
+  window with different `ignore.patterns` no longer wipes another window's
+  recorded originals. New captures are still refused. Removing the rule can
+  bring the review back.
+- **Hook peer registrations expire.** A crashed window's folder list is dropped
+  after a short idle interval, and closing the last window rebuilds the hook
+  list from this folder alone rather than restoring the previous combined
+  file.
+- **Undo finds a file Git and VS Code spell differently.** On Windows a
+  shell-created file was listed in the queue (git's `D:\...`) while Undo from
+  the editor looked up `d:\...`, reported nothing to undo, and left the file on
+  disk. In-memory review state now folds path case the same way the on-disk
+  keys already did.
+
 ### Added — hunk navigation CodeLens
 
 - **When a file has several hunks**, the hunk under the caret also shows
@@ -31,16 +108,16 @@ Claude Code issues roughly **twelve Bash calls for every edit-tool call**.
   the files used to hold anyway. Before the command, one `git status` records the
   commit being compared against and the handful of files that already differ from
   it; those are copied aside. After it, a second `git status` says what changed,
-  and every changed file either gets a byte-exact baseline or is listed as *not
-  reviewable* with the reason.
+  and every changed file either gets a byte-exact baseline or is listed as _not
+  reviewable_ with the reason.
 - **Recovery uses `git cat-file --filters`, never the raw object.** In a
   repository with `text=auto eol=crlf` the stored object has LF endings while the
   working file has CRLF, so an Undo built from the raw blob would rewrite every
   line in the file.
-- **A new setting, `claudeKeepUndo.detection.bashChanges`.** The default, *files
-  it creates*, reads no pre-existing file at all — the baseline of a file that
+- **A new setting, `claudeKeepUndo.detection.bashChanges`.** The default, _files
+  it creates_, reads no pre-existing file at all — the baseline of a file that
   did not exist is not a guess — so that tier cannot record a wrong one by
-  construction. *Files it creates and modifies* additionally copies
+  construction. _Files it creates and modifies_ additionally copies
   already-modified files aside before each command. Changing it re-registers the
   hooks by itself.
 - **Commands that cannot write are skipped** without taking a snapshot. The list
@@ -130,7 +207,7 @@ Claude Code issues roughly **twelve Bash calls for every edit-tool call**.
   cannot be undone from inside — git's own rule. Matching follows the platform,
   case-insensitive everywhere but Linux.
 - **An ignored file is not detected at all**: no gutter bars, no queue entry, no
-  *not reviewable* row, and no copy of its content in the extension's storage.
+  _not reviewable_ row, and no copy of its content in the extension's storage.
   The rules are enforced inside the Claude Code hook as well as in the extension,
   so an excluded file is never read — by the time a baseline exists, a verbatim
   copy is already on disk, which is too late to make that promise about a `.env`.
@@ -141,11 +218,11 @@ Claude Code issues roughly **twelve Bash calls for every edit-tool call**.
   `.gitignore` when asked, and `claudeKeepUndo.ignore.patterns` for rules that
   are yours rather than the project's.
 - Settings `claudeKeepUndo.ignore.useIgnoreFile`, `ignore.patterns`,
-  `ignore.useDefaults` and `ignore.useGitignore`, in a new *Ignored files* group
+  `ignore.useDefaults` and `ignore.useGitignore`, in a new _Ignored files_ group
   in the Settings editor and in the setup panel — which grows a list control and
   a link that creates `.keepundoignore` from a commented template.
 - Command **Stop Reviewing This File**, on the changes view and Source Control
-  context menus. Excluding a file that has changes waiting *keeps* them — the
+  context menus. Excluding a file that has changes waiting _keeps_ them — the
   recorded original is deleted with the queue entry — so the command names the
   files and the number of changes and asks first. A rule that arrives some other
   way (a hand edit, a colleague's commit, a settings change) reaches the same
@@ -166,7 +243,7 @@ published, so these notes cover the whole distance from there. 194 unit tests an
 - Explorer badge (`✳`) and themeable color for files Claude modified.
 - Diff view against a recorded pre-Claude baseline (`claude-baseline:` scheme).
 - Per-hunk `Keep` / `Undo` CodeLens plus per-file `Keep all` / `Undo all`.
-- *Claude: Changes to Review* tree view with per-file and per-hunk inline
+- _Claude: Changes to Review_ tree view with per-file and per-hunk inline
   actions and global Keep All / Undo All.
 - Change detection via Claude Code `PreToolUse`/`PostToolUse` hooks.
 - Zero-config change detection via the session transcript, reconstructing
@@ -191,9 +268,9 @@ published, so these notes cover the whole distance from there. 194 unit tests an
 - **Keep/Undo on the line-number context menu.**
 - **Review All Claude Changes (Multi-File Diff)** — opens every pending file in a
   single Multi Diff Editor tab via the built-in `vscode.changes` command.
-- A *Claude Changes* Source Control entry listing the pending files with inline
+- A _Claude Changes_ Source Control entry listing the pending files with inline
   Keep/Undo actions and a count badge.
-- **Recovery snapshots** and the *Claude Keep/Undo: Reveal Recovery Snapshots*
+- **Recovery snapshots** and the _Claude Keep/Undo: Reveal Recovery Snapshots_
   command. Every destructive action copies the file aside first; copies are kept
   for 14 days.
 
@@ -201,35 +278,35 @@ published, so these notes cover the whole distance from there. 194 unit tests an
 
 - **Go to next / previous change** (`Ctrl+Alt+N` / `Ctrl+Alt+P`, `Cmd` on
   macOS), wrapping at both ends. There were commands to act on a change and none
-  to *find* one, so reviewing a long file meant hunting for gutter bars.
+  to _find_ one, so reviewing a long file meant hunting for gutter bars.
 - **Keep / Undo from the keyboard** (`Ctrl+Alt+K` / `Ctrl+Alt+U`). All four
   bindings are scoped to files Claude has actually changed, so they give the
   keys back everywhere else.
 - **Restore the last Undo.** Every Undo now ends in a notification with a
   **Restore** button that puts the file back exactly as Claude left it —
-  content *and* baseline, so it returns to the queue rather than being silently
+  content _and_ baseline, so it returns to the queue rather than being silently
   accepted. Also available as a command. The recovery snapshot always made this
   possible by hand; now it is a button at the moment you need it.
 - **Keep and Undo confirm themselves** in the status bar (`Kept 3 changes in
-  auth.ts`). From the Quick Fix menu or the line-number menu there was
+auth.ts`). From the Quick Fix menu or the line-number menu there was
   previously no sign that anything had happened when the change was off-screen.
 - **A status bar entry** counting the files awaiting review, clickable straight
   into the multi-file diff — the only ambient signal that survives having the
   Explorer closed.
-- **A count badge on the changes view header**, so a collapsed *Claude: Changes
-  to Review* still reports its queue. The Source Control entry always had one.
+- **A count badge on the changes view header**, so a collapsed _Claude: Changes
+  to Review_ still reports its queue. The Source Control entry always had one.
 
 ### Added — configuration
 
-- **A setup panel**: *Claude Keep/Undo: Settings and Setup*, also on the gear in
+- **A setup panel**: _Claude Keep/Undo: Settings and Setup_, also on the gear in
   the changes view title bar. Shows what is currently detected (hooks,
   transcript, pending queue), offers **Minimal** / **Recommended** /
   **Everything** presets, and explains what each surface costs before you turn
   it on. It writes ordinary VS Code settings, per user or per workspace.
 - **A four-step walkthrough** on the Getting Started page, so the hook install
   has a home other than a startup notification.
-- **The Settings editor entries are grouped and ordered** — *Review surfaces*,
-  *Pending queue*, *Safety and feedback*, *Detection* — with a label and an
+- **The Settings editor entries are grouped and ordered** — _Review surfaces_,
+  _Pending queue_, _Safety and feedback_, _Detection_ — with a label and an
   explanation for every enum value. They used to be seven flat properties in
   historical order, with the two that change what you see below the detection
   toggles.
@@ -286,8 +363,8 @@ and **every one of them is a setting**.
   the color theme and reading far louder than any other lens in the editor.
   `emoji` restores them.
 - **Quick Fix no longer offers whole-file actions from anywhere in the file**
-  (`claudeKeepUndo.quickFixes`, default `hunkAndFile`). *Undo all Claude changes
-  in this file* used to sit next to *Add missing import* on an ESLint error four
+  (`claudeKeepUndo.quickFixes`, default `hunkAndFile`). _Undo all Claude changes
+  in this file_ used to sit next to _Add missing import_ on an ESLint error four
   hundred lines from any change, in a menu people operate by muscle memory. All
   four actions now require the cursor to be inside a change.
 - **The Explorer badge no longer propagates to the workspace root**
@@ -295,28 +372,28 @@ and **every one of them is a setting**.
   anything anywhere is pending carries no information, and it collided with
   Git's own folder decorations. `fileAndFolders` restores it.
 - **The Explorer right-click entry appears only when something is pending.**
-  `resourceScheme == file` is every file in the project, so *Open Diff of
-  Claude's Changes* was a context-menu entry whose usual outcome was an apology.
+  `resourceScheme == file` is every file in the project, so _Open Diff of
+  Claude's Changes_ was a context-menu entry whose usual outcome was an apology.
   It can also be removed entirely (`claudeKeepUndo.explorerContextMenu`).
 
 ### Changed — wording and layout
 
 - **Changes view rows lead with the code**, not the coordinates: `const retries
-  = 5` in the label and `L14 · +3 −1` beside it, the way the Search and Problems
+= 5` in the label and `L14 · +3 −1` beside it, the way the Search and Problems
   views are laid out.
 - **Diff tabs are titled `auth.ts (Claude)`** instead of `src/api/auth.ts:
-  baseline ↔ Claude's changes`. Tabs truncate from the right, so the old title
+baseline ↔ Claude's changes`. Tabs truncate from the right, so the old title
   rendered as `src/api…` with three tabs open — the half that does not identify
   the file. The parent directory is added back only when two pending files share
   a basename.
-- **One name for the degraded state.** *too different to split*, *whole region*,
-  *one change (too different to split)* and a fourth phrasing in the tooltip are
+- **One name for the degraded state.** _too different to split_, _whole region_,
+  _one change (too different to split)_ and a fourth phrasing in the tooltip are
   now all **whole file rewritten**, with a single explanation behind it.
 - **The doubled-gutter explanation waits for something to look at.** It used to
   fire at activation in every Git repository, before any bar or widget existed —
   an unprompted advertisement that spent its one chance on nothing. It now
   appears the first time a tracked file is actually visible with gutter bars on,
-  and is marked as seen *after* it has been answered rather than before it is
+  and is marked as seen _after_ it has been answered rather than before it is
   shown, so a restart or a burst of other toasts no longer swallows it.
 - **The empty changes view no longer offers to install hooks that are already
   installed** — the steady state of a healthy install used to show a button that
@@ -331,7 +408,7 @@ and **every one of them is a setting**.
   compile against APIs newer than the declared engine.
 - Fully localized the extension to English: settings, commands, view names,
   notifications, tooltips and log output.
-- Renamed the display name to *Keep / Undo for Claude Code* and added an
+- Renamed the display name to _Keep / Undo for Claude Code_ and added an
   explicit "unofficial, not affiliated with Anthropic" disclaimer. The extension
   identifier settled at `FedeFluork.claude-keep-undo`. Nothing had been
   published under the old name, so no installed extension is affected.
@@ -366,8 +443,8 @@ producing a baseline that never existed.
   record is inert, and a call whose result never arrives makes the file not
   reviewable instead of being reconstructed from the calls that did land.
 - **A store event with no uri no longer discards a reconstruction in flight.**
-  "Has no baseline" and "is resolved" were the same test, so *Keep All*, *Undo
-  All* or an unreviewable file appearing during a Claude burst threw away the
+  "Has no baseline" and "is resolved" were the same test, so _Keep All_, _Undo
+  All_ or an unreviewable file appearing during a Claude burst threw away the
   edits already recorded for every other file — and the next edit registered a
   partial baseline, holding Claude's own output, as the user's original.
 - **A pre-`Write` snapshot must prove it predates the write.** The strategy rests
@@ -383,7 +460,7 @@ producing a baseline that never existed.
 **2. An Undo could lose its own parachute.**
 
 - **A failed save no longer destroys the baseline.** The edit was applied to the
-  open document *before* saving, so a save that failed — a read-only file, a save
+  open document _before_ saving, so a save that failed — a read-only file, a save
   conflict — left the buffer dirty holding the restored content. The recompute
   that followed prefers a dirty buffer over disk, found no difference, and deleted
   the baseline: the only copy of the pre-Claude content, gone, while Claude's
@@ -398,13 +475,13 @@ producing a baseline that never existed.
   successful restore, and the baseline deleted, thirteen lines from the code that
   refuses to act on exactly that condition.
 - **"Undo could not be written to disk" now means the write failed.** It was also
-  shown when the write *succeeded* and a save participant reformatted the result —
+  shown when the write _succeeded_ and a save participant reformatted the result —
   format-on-save, insert-final-newline — which is an everyday outcome. The
   pre-Undo content was already replaced, the message said otherwise, and the
   Restore button that was the only way back was suppressed. That case is now a
   warning, the file stays under review, and the restore point is armed.
 
-**3. *Restore the Last Undo* is now disarmed when it stops being safe.** It was
+**3. _Restore the Last Undo_ is now disarmed when it stops being safe.** It was
 the one destructive write in the extension that took no recovery snapshot, had no
 confirmation and no expiry, so it sat in the view title for the rest of the
 session and re-applied whole-file content captured arbitrarily long ago.
@@ -414,7 +491,7 @@ session and re-applied whole-file content captured arbitrarily long ago.
   which files it left alone and where the bytes still are.
 - The record is dropped as soon as a file it covers changes again, and expires
   after five minutes.
-- The Restore button on a notification restores *that* Undo. It read "the most
+- The Restore button on a notification restores _that_ Undo. It read "the most
   recent one" at click time, so a click on "Undid 1 change in fileA.ts" restored
   fileB.ts. A superseded notification now explains itself.
 
@@ -433,7 +510,7 @@ every VS Code window on the machine shares.
   review does not flip out of inline diff mid-review; and the record is cleared
   with a compare-and-swap, so a race cannot end with the override applied and
   nothing left to undo it.
-- Releasing an override writes *first* and drops the state after. The other order
+- Releasing an override writes _first_ and drops the state after. The other order
   meant a rejected write (VS Code refuses to write a `settings.json` with a syntax
   error) left the override on disk with the state saying otherwise — and the next
   override then recorded its own leftover as the user's value. A failed write is
@@ -466,11 +543,11 @@ hundred characters and only looks at the first 8 KiB.
 
 ### Fixed — Undo All
 
-Cross-cutting to all five: what *Undo All* confirms, what it acts on and what it
+Cross-cutting to all five: what _Undo All_ confirms, what it acts on and what it
 reports were three different things.
 
 - **It acts only on the set it confirmed.** The work list was re-read from live
-  state at call time, i.e. *after* the modal — and the watchers keep registering
+  state at call time, i.e. _after_ the modal — and the watchers keep registering
   baselines while a modal is up. Every file that appeared in that window was
   reverted without being named in the confirmation, without a snapshot the Restore
   button could use, and — if Claude had created it — deleted with no deletion
@@ -485,7 +562,7 @@ reports were three different things.
   skipped because they were no longer pending are now reported separately.
 - **The strongest confirmation states its scope.** With one hand-edited file among
   forty pending, the dialog described that one file, asserted "Undo restores the
-  whole file", and offered *Undo Anyway* — the safer-looking case was the one that
+  whole file", and offered _Undo Anyway_ — the safer-looking case was the one that
   said less. It now names the count and the risk together.
 
 ### Fixed — silent failures
@@ -497,8 +574,8 @@ working, or write to their settings behind their back.
 
 - **A transcript line larger than 1 MiB no longer kills the reader for the rest
   of the session.** The reader consumed at most a megabyte at a time and required
-  a newline inside that window; finding none it returned *without advancing the
-  offset*, so every later tick re-read the same megabyte — synchronously, on the
+  a newline inside that window; finding none it returned _without advancing the
+  offset_, so every later tick re-read the same megabyte — synchronously, on the
   extension-host thread — and every edit Claude made afterwards was invisible,
   with no error, no log line and no warning. Claude reading a large lockfile or
   writing a large file is enough to produce such a line; the largest one in the
@@ -520,7 +597,7 @@ working, or write to their settings behind their back.
 - **Every per-hunk action now checks that the file is still the one the hunks were
   computed from.** The content checks inside the apply functions cannot establish
   that: for a pure deletion the current-side check has an empty expectation and so
-  matches at *any* position, and the baseline-side check compares against a string
+  matches at _any_ position, and the baseline-side check compares against a string
   the store only ever replaces wholesale. So a file rewritten under the store — a
   `git checkout`, a `prettier --write` from a terminal, a keystroke inside the
   200 ms debounce — had the restored lines spliced in where they no longer belonged,
@@ -544,7 +621,7 @@ working, or write to their settings behind their back.
   what told the store the file was fully reviewed and its baseline could be deleted.
   Claude's `Write` tool emits LF, so every CRLF file was one `Write` away from
   losing its original terminators permanently. The file now stays under review as
-  *line endings changed*, and Undo restores them byte for byte.
+  _line endings changed_, and Undo restores them byte for byte.
 - **A restored baseline is no longer rewritten by the editor on its way to disk.**
   A text document holds one line ending for the whole buffer and rewrites every
   terminator to it, so writing CRLF content into a buffer VS Code had loaded as LF
@@ -569,7 +646,7 @@ working, or write to their settings behind their back.
   the previous one rather than leaving one that describes bytes that were never
   written.
 - **An unreadable descriptor is no longer read as a missing one.** The sweep
-  deleted the content file whenever the sidecar could not be *read*, conflating a
+  deleted the content file whenever the sidecar could not be _read_, conflating a
   transient `EACCES`, an `EMFILE` while sweeping hundreds of baselines, or an
   indexer holding the file open with genuine absence. Only absence justifies the
   delete now, and a just-promoted baseline is given a grace window, since promotion
@@ -583,7 +660,7 @@ working, or write to their settings behind their back.
   consulted. The store re-diffs after every keystroke, so a line typed next to
   Claude's edit is merged into the same hunk and the splice takes it too. The
   dialog now fires, with wording scoped to the hunk rather than the whole file.
-- **An edit made *before* Claude's is remembered.** The flag was only ever set for
+- **An edit made _before_ Claude's is remembered.** The flag was only ever set for
   files already under review, so the dangerous ordering was the one thrown away:
   the user types without saving, Claude then edits the file, and the baseline is
   read from disk — so those unsaved lines are absent from it and are attributed to
@@ -612,7 +689,7 @@ working, or write to their settings behind their back.
   were byte-identical — and every whole-file rewrite is longer than that. Comment
   threads key their "has anything changed?" check on exactly this, so a later edit
   inside a long hunk left the thread rendering the previous revision while Keep
-  folded the *current* content into the baseline: the user accepted lines they had
+  folded the _current_ content into the baseline: the user accepted lines they had
   never been shown.
 
 **Settings and layout written behind the user's back.**
@@ -655,7 +732,7 @@ working, or write to their settings behind their back.
   directory.
 - **The same project opened in two VS Code builds works.** A registration recorded
   by another build was classified as somebody else's script, because the check
-  required the *same* extensions directory. Stable, Insiders, Cursor and a source
+  required the _same_ extensions directory. Stable, Insiders, Cursor and a source
   checkout each have their own, so the second window showed a security-flavoured
   warning on every activation, with no way to dismiss it, and never repointed the
   hooks at its own state directory — reviewing nothing at all, permanently. Any
@@ -688,7 +765,7 @@ working, or write to their settings behind their back.
   as the "original" for an edit made days later — so Undo restored week-old
   content.
 - **A whole-file `Write` is never reconstructed as an empty baseline.** It used to
-  produce `baseline = ""`, which made *Undo* truncate the file. The watcher now
+  produce `baseline = ""`, which made _Undo_ truncate the file. The watcher now
   snapshots the file when the `Write` is announced and only trusts that snapshot
   once the file has actually changed; otherwise the file is reported as not
   reviewable.
@@ -702,11 +779,11 @@ working, or write to their settings behind their back.
   replace. A stale action is refused with a message instead of corrupting the
   file.
 - **Undo is now reversible.** Destructive actions snapshot the file first (see
-  *Reveal Recovery Snapshots*), always write through the editor's undo stack, and
+  _Reveal Recovery Snapshots_), always write through the editor's undo stack, and
   ask for confirmation naming any file you have also edited yourself.
 - **Deletions and ambiguous edits are no longer guessed.** Transcript
   reconstruction refuses a deletion (which has no anchor), refuses a replacement
-  that occurs more than once, and *proves* every result by replaying the edits
+  that occurs more than once, and _proves_ every result by replaying the edits
   forward. Coverage without hooks is narrower as a result — deliberately.
 
 ### Fixed — detection
@@ -790,14 +867,14 @@ working, or write to their settings behind their back.
   every action on such a file came back "that change moved".
 - Inline comment threads no longer show a stale diff when a hunk changes without
   changing shape: the redraw key now digests content, not just positions.
-- *Review All Claude Changes* gets its per-hunk CodeLens: the Multi Diff Editor
+- _Review All Claude Changes_ gets its per-hunk CodeLens: the Multi Diff Editor
   tab was not recognised, so the multi-file review had no affordance at all.
 - The temporary `diffEditor.*` overrides are written at the scope that is
   actually in effect. A workspace-level value silently shadowed them, which
   turned off the per-hunk CodeLens inside the diff — the primary review
   affordance — with no error anywhere. A value you change while an override is
   held is now adopted instead of discarded.
-- *Reveal Recovery Snapshots* reports an empty state instead of revealing a
+- _Reveal Recovery Snapshots_ reports an empty state instead of revealing a
   directory that does not exist.
 - Keep/Undo on a file with nothing pending says so instead of doing nothing.
 - A bulk refresh now updates open baseline documents, and the baseline content
@@ -860,7 +937,7 @@ working, or write to their settings behind their back.
 - One unit test encoded the wrong assumption rather than catching it: it asserted
   that reversing `replace_all` over `y y y` yields `x x x`. It now asserts the
   refusal, and the case it got wrong is a test.
-- Another encoded a *cost* guarantee that was hiding a correctness bug: it required
+- Another encoded a _cost_ guarantee that was hiding a correctness bug: it required
   hunk fingerprinting not to scale with hunk size, which is what the head/tail
   sampling bought and what made a change in the middle of a long hunk invisible. It
   now asserts that a middle change is noticed, alongside a loose ceiling on the cost
@@ -876,4 +953,4 @@ working, or write to their settings behind their back.
 - The multi-window `diffEditor.*` behaviour is covered by driving the compiled
   controller against a stubbed `vscode` with one shared settings store, one shared
   memento and one shared config event bus. Every failure in that group was
-  *between* windows, and none of it is reachable from a single-window test.
+  _between_ windows, and none of it is reachable from a single-window test.

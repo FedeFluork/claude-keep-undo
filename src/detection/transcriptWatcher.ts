@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
-import { ChangeStore } from "../changeStore";
+import { ReviewStore } from "../changeStore";
 import {
   claudeFileHistoryDir,
   claudeProjectsDir,
@@ -257,7 +257,7 @@ export class TranscriptWatcher implements vscode.Disposable {
 
   constructor(
     private readonly cwd: string,
-    private readonly store: ChangeStore,
+    private readonly store: ReviewStore,
     private readonly log: (msg: string) => void
   ) {
     // Forget a file's history once it has been fully reviewed, so a later edit

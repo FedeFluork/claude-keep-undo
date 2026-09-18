@@ -17,22 +17,36 @@ import {
   atomicCopy,
   atomicWrite,
   BASELINE_SCHEME,
+  CURRENT_SCHEME,
   baselinesDir,
   BytesReadResult,
+  locateStatePair,
+  ownStatePair,
   ensureDir,
+  existingStatePairs,
   fileExists,
+  HookPeerFolder,
   legacyStateDir,
   listDir,
   looksBinary,
   moveDir,
   normalizePath,
+  owningPeer,
+  otherWindowHoldsFolder,
+  PathMap,
+  PathSet,
+  pathIsInFolderScope,
   pathKey,
   bashDir,
   pendingDir,
   readFileBytesResult,
   readFileSafe,
   readSidecar,
+  relatedFolderStores,
+  rehomeDisplacedPairs,
+  relocateStatePair,
   removeFile,
+  removeStatePairs,
   sidecarPath,
   snapshotsDir,
   uniqueSuffix,
@@ -192,12 +206,72 @@ const ORPHAN_GRACE_MS = 5_000;
 const USER_TOUCHED_MAX = 2048;
 
 /**
+ * The review-store surface the UI, commands and transcript watcher talk to.
+ *
+ * {@link ChangeStore} is one folder. The hub is the same questions asked of
+ * every folder in the window, routing each path to the store that owns it. An
+ * interface rather than the class keeps the UI off the private members that
+ * would make the hub unassignable.
+ */
+export interface ReviewStore {
+  readonly onDidChange: vscode.Event<vscode.Uri | undefined>;
+  readonly onDidDetect: vscode.Event<vscode.Uri>;
+  getTracked(): TrackedFile[];
+  isTracked(absPath: string): boolean;
+  hasBaseline(absPath: string): boolean;
+  get(absPath: string): TrackedFile | undefined;
+  count(): number;
+  isApplyingEdit(): boolean;
+  isUserTouched(absPath: string): boolean;
+  isCreated(absPath: string): boolean;
+  isInScope(absPath: string): boolean;
+  isIgnored(absPath: string): boolean;
+  getUnreviewable(): Unreviewable[];
+  noteUnreviewable(absPath: string, reason: string): void;
+  clearUnreviewable(absPath?: string): void;
+  noteUserEdit(absPath: string): void;
+  getBaseline(absPath: string): string;
+  hunkIndexAtLine(absPath: string, line: number): number | undefined;
+  registerBaseline(
+    absPath: string,
+    baseline: string,
+    options?: { created?: boolean }
+  ): void;
+  refreshFromDisk(): void;
+  reloadBaseline(absPath: string): void;
+  recompute(absPath: string, silent?: boolean, noResolve?: boolean): void;
+  keepHunk(absPath: string, index: number, fingerprint?: string): ApplyResult;
+  undoHunk(
+    absPath: string,
+    index: number,
+    fingerprint?: string
+  ): Promise<ApplyResult>;
+  keepLineChange(absPath: string, change: LineChange): ApplyResult;
+  undoLineChange(absPath: string, change: LineChange): Promise<ApplyResult>;
+  keepFile(absPath: string): void;
+  undoFile(absPath: string): Promise<ApplyResult>;
+  keepAll(): void;
+  undoAll(): Promise<UndoBatchResult>;
+  undoPaths(paths: string[]): Promise<UndoBatchResult>;
+  captureUndoSnapshot(absPath: string): UndoSnapshot | undefined;
+  stampPostUndo(snapshots: UndoSnapshot[]): UndoSnapshot[];
+  restoreUndoSnapshots(
+    snapshots: UndoSnapshot[]
+  ): Promise<{ failed: string[]; stale: string[] }>;
+  snapshotsLocation(): string;
+  wouldDelete(absPath: string): boolean;
+  reconcileIgnored(): string[];
+}
+
+/**
  * Single source of truth for "what has Claude changed and not yet reviewed".
  *
- * State is backed by files under VS Code's per-workspace storage directory —
- * deliberately *outside* the repository, because baselines and snapshots are
- * verbatim copies of the user's source and one `git add -A` away from committing
- * whatever secrets those files held:
+ * State is backed by files under VS Code's global storage, one directory per
+ * workspace folder — deliberately *outside* the repository, because baselines
+ * and snapshots are verbatim copies of the user's source and one `git add -A`
+ * away from committing whatever secrets those files held. Keyed by folder path
+ * (not by the VS Code workspace) so the same repo keeps its review queue when
+ * opened alone or in another window:
  *   - baselines/<key>        raw original content (before Claude's edits)
  *   - baselines/<key>.json   { path, ts } — makes the baseline self-describing
  *
@@ -209,16 +283,20 @@ const USER_TOUCHED_MAX = 2048;
  * content. Keep folds the change into the baseline; Undo reverts the file.
  * Either way, once baseline === current the entry resolves and disappears.
  */
-export class ChangeStore implements vscode.Disposable {
-  private tracked = new Map<string, TrackedFile>();
-  private userTouched = new Set<string>();
-  private unreviewable = new Map<string, string>();
+export class ChangeStore implements vscode.Disposable, ReviewStore {
+  private tracked = new PathMap<TrackedFile>();
+  private userTouched = new PathSet();
+  private unreviewable = new PathMap<string>();
   /** Paths whose baseline records that Claude created the file. */
-  private createdFiles = new Set<string>();
+  private createdFiles = new PathSet();
   private applying = 0;
   private lastStateWrite = 0;
   private disposed = false;
   private trackOutsideWorkspace = false;
+  /** Other folders in this window; files under them are not ours. */
+  private peerRoots: string[] = [];
+  /** Same peers, with state dirs so an owned path can be moved rather than dropped. */
+  private peers: HookPeerFolder[] = [];
   private readonly normalizedRoot: string;
   private housekeeping: NodeJS.Timeout | undefined;
   private readonly disposables: vscode.Disposable[] = [];
@@ -294,24 +372,152 @@ export class ChangeStore implements vscode.Disposable {
   }
 
   /**
+   * Other workspace folders in this window. Files under those roots belong to
+   * *their* store, including when this folder is nested around one of them.
+   * Each peer's `stateDir` is what lets a displaced baseline move instead of
+   * being deleted.
+   */
+  setPeerFolders(folders: readonly HookPeerFolder[]): void {
+    this.peers = folders.filter(
+      (folder) => normalizePath(folder.root) !== this.normalizedRoot
+    );
+    this.peerRoots = this.peers.map((folder) => folder.root);
+  }
+
+  /**
+   * Move baselines and stagings that another folder in this window now owns
+   * into that folder's state directory. Ownership is decided among this folder
+   * *and* its peers: an inner store that only looked at the outer peer would
+   * bounce nested files back out. Returns whether anything moved, so the hub
+   * can refresh the destination store afterwards.
+   */
+  rehomeDisplaced(): boolean {
+    if (this.peers.length === 0) {
+      return false;
+    }
+    return this.relocateOwnedByOthers(this.ownershipCandidates());
+  }
+
+  /**
+   * Hand this folder's displaced copies to whichever of `folders` owns them.
+   * Used when the folder is leaving the window: pass only the folders that
+   * remain, so a nested store does transfer to the outer one.
+   */
+  rehomeToward(folders: readonly HookPeerFolder[]): boolean {
+    return this.relocateOwnedByOthers(folders, true);
+  }
+
+  private ownershipCandidates(): HookPeerFolder[] {
+    return [
+      { root: this.workspaceRoot, stateDir: this.stateDir },
+      ...this.peers,
+    ];
+  }
+
+  /**
+   * This folder plus parent and nested folder stores on disk.
+   *
+   * An outer-only window lists reviews that already live in a nested store;
+   * a nested window lists reviews that still live in the parent store. Sibling
+   * repos share the `folders/` directory but are not related. Each store still
+   * only queues files it owns, so one window does not show the same nested
+   * file on both folder rows.
+   */
+  private relatedStores(): HookPeerFolder[] {
+    return [
+      { root: this.workspaceRoot, stateDir: this.stateDir },
+      ...relatedFolderStores(this.stateDir, this.workspaceRoot),
+    ];
+  }
+
+  /** True when `fsPath` lives in a related store this window is surfacing. */
+  coversInheritedState(fsPath: string): boolean {
+    const n = normalizePath(fsPath);
+    return this.relatedStores().some((folder) => {
+      if (normalizePath(folder.stateDir) === normalizePath(this.stateDir)) {
+        return false;
+      }
+      const root = normalizePath(folder.stateDir);
+      return n === root || n.startsWith(root + path.sep);
+    });
+  }
+
+  private relocateOwnedByOthers(
+    owners: readonly HookPeerFolder[],
+    leaving = false
+  ): boolean {
+    const n =
+      rehomeDisplacedPairs(
+        this.stateDir,
+        this.workspaceRoot,
+        owners,
+        "baselines",
+        this.log,
+        leaving
+      ) +
+      rehomeDisplacedPairs(
+        this.stateDir,
+        this.workspaceRoot,
+        owners,
+        "pending",
+        this.log,
+        leaving
+      );
+    if (n > 0) {
+      this.markStateWrite();
+    }
+    return n > 0;
+  }
+
+  /** Move this path's baseline and staging into the folder that owns it, if any. */
+  private rehomePath(absPath: string): boolean {
+    const peer = owningPeer(this.ownershipCandidates(), absPath);
+    if (!peer || normalizePath(peer.root) === this.normalizedRoot) {
+      return false;
+    }
+    if (otherWindowHoldsFolder(this.stateDir, this.workspaceRoot, peer.root)) {
+      return false;
+    }
+    let any = false;
+    const pairs: { src: string; destDir: string }[] = [
+      {
+        src: this.ownBaselinePath(absPath),
+        destDir: baselinesDir(peer.stateDir),
+      },
+      {
+        src: this.ownPendingPath(absPath),
+        destDir: pendingDir(peer.stateDir),
+      },
+    ];
+    for (const { src, destDir } of pairs) {
+      const result = relocateStatePair(src, destDir);
+      if (result === "moved" || result === "kept-destination") {
+        any = true;
+      }
+    }
+    if (any) {
+      this.markStateWrite();
+      this.log(`moved recorded state for ${absPath} into ${peer.root}`);
+    }
+    return any;
+  }
+
+  /**
    * Is this path one we should be reviewing at all?
    *
    * Claude edits files outside the open folder routinely — its own settings, a
    * scratch file, a sibling repository it was asked to read. Tracking those puts
-   * verbatim copies of them into *this* workspace's state directory and lists
-   * them in a view whose paths are relative to a root they are not under.
+   * verbatim copies of them into *this* folder's state directory and lists them
+   * in a view whose paths are relative to a root they are not under. A sibling
+   * workspace folder is not "outside": it has its own store.
    */
   isInScope(absPath: string): boolean {
-    if (this.trackOutsideWorkspace) {
-      return true;
-    }
-    const rel = path.relative(this.normalizedRoot, normalizePath(absPath));
-    if (rel === "" || path.isAbsolute(rel)) {
-      return false;
-    }
-    // `startsWith("..")` also matches a directory genuinely named `..cache`,
-    // which would then be silently excluded from review.
-    return rel !== ".." && !rel.startsWith(`..${path.sep}`);
+    return pathIsInFolderScope(
+      absPath,
+      this.workspaceRoot,
+      this.peerRoots,
+      this.trackOutsideWorkspace
+    );
   }
 
   /**
@@ -320,7 +526,7 @@ export class ChangeStore implements vscode.Disposable {
    * Deliberately a separate question from {@link isInScope}, even though the two
    * are consulted together everywhere. Being outside the workspace is a fact
    * about the path; being ignored is an instruction, it can be withdrawn, and
-   * the two want different words in the log when a baseline is dropped.
+   * the two want different words in the log when a baseline is hidden.
    */
   isIgnored(absPath: string): boolean {
     return this.ignore.isIgnored(absPath);
@@ -467,7 +673,10 @@ export class ChangeStore implements vscode.Disposable {
       if (this.userTouched.size <= USER_TOUCHED_MAX) {
         break;
       }
-      if (!this.tracked.has(candidate) && candidate !== absPath) {
+      if (
+        !this.tracked.has(candidate) &&
+        candidate !== normalizePath(absPath)
+      ) {
         this.userTouched.delete(candidate);
       }
     }
@@ -516,11 +725,20 @@ export class ChangeStore implements vscode.Disposable {
   // --- disk layout ---------------------------------------------------------
 
   private baselinePath(absPath: string): string {
-    return path.join(baselinesDir(this.stateDir), pathKey(absPath));
+    return locateStatePair(
+      absPath,
+      this.relatedStores(),
+      "baselines",
+      this.stateDir
+    );
   }
 
-  private pendingPath(absPath: string): string {
-    return path.join(pendingDir(this.stateDir), pathKey(absPath));
+  private ownBaselinePath(absPath: string): string {
+    return ownStatePair(absPath, this.stateDir, "baselines");
+  }
+
+  private ownPendingPath(absPath: string): string {
+    return ownStatePair(absPath, this.stateDir, "pending");
   }
 
   private markStateWrite(): void {
@@ -556,14 +774,53 @@ export class ChangeStore implements vscode.Disposable {
     content: string,
     created = this.createdFiles.has(absPath)
   ): boolean {
-    const target = this.baselinePath(absPath);
+    const stores = this.relatedStores();
+    const displayed = locateStatePair(
+      absPath,
+      stores,
+      "baselines",
+      this.stateDir
+    );
+    const existing = existingStatePairs(absPath, stores, "baselines");
+    const targets =
+      existing.length > 0
+        ? [
+            displayed,
+            ...existing.filter(
+              (contentPath) =>
+                normalizePath(contentPath) !== normalizePath(displayed)
+            ),
+          ]
+        : [displayed];
     this.markStateWrite();
-    // The sidecar goes first, and its result is checked. `baselinePaths()`
-    // enumerates content files and used to treat one with an unreadable sidecar as
-    // an orphan to delete, so a content file that outlived a failed sidecar write
-    // was destroyed by the next sweep — taking every unreviewed change in that
-    // file with it, after the UI had already reported the action as applied. A
-    // sidecar with no content behind it, by contrast, is simply never looked at.
+    for (const target of targets) {
+      if (!this.writeBaselineAt(target, absPath, content, created)) {
+        return false;
+      }
+    }
+    if (created) {
+      this.createdFiles.add(absPath);
+    } else {
+      this.createdFiles.delete(absPath);
+    }
+    return true;
+  }
+
+  /**
+   * Write one baseline content+sidecar pair. The sidecar goes first, and its
+   * result is checked. `baselinePaths()` enumerates content files and used to
+   * treat one with an unreadable sidecar as an orphan to delete, so a content
+   * file that outlived a failed sidecar write was destroyed by the next sweep
+   * — taking every unreviewed change in that file with it, after the UI had
+   * already reported the action as applied. A sidecar with no content behind
+   * it, by contrast, is simply never looked at.
+   */
+  private writeBaselineAt(
+    target: string,
+    absPath: string,
+    content: string,
+    created: boolean
+  ): boolean {
     const previous = readFileSafe(sidecarPath(target));
     if (
       !this.writeSidecar(
@@ -591,18 +848,49 @@ export class ChangeStore implements vscode.Disposable {
       }
       return false;
     }
-    if (created) {
-      this.createdFiles.add(absPath);
-    } else {
-      this.createdFiles.delete(absPath);
-    }
     return true;
   }
 
   /** Every path that currently has a baseline on disk, with its creation flag. */
   private baselinePaths(): { path: string; created: boolean }[] {
-    const dir = baselinesDir(this.stateDir);
+    const stores = this.relatedStores();
+    const inScope = new PathSet();
+    this.collectBaselines(baselinesDir(this.stateDir), inScope, true);
+    for (const folder of relatedFolderStores(
+      this.stateDir,
+      this.workspaceRoot
+    )) {
+      this.collectBaselines(baselinesDir(folder.stateDir), inScope, false);
+    }
     const paths: { path: string; created: boolean }[] = [];
+    for (const absPath of inScope.values()) {
+      const contentPath = locateStatePair(
+        absPath,
+        stores,
+        "baselines",
+        this.stateDir
+      );
+      const sidecar = readSidecar(contentPath);
+      if (
+        !sidecar ||
+        !this.isInScope(sidecar.path) ||
+        this.isIgnored(sidecar.path)
+      ) {
+        continue;
+      }
+      paths.push({
+        path: sidecar.path,
+        created: sidecar.created === true,
+      });
+    }
+    return paths;
+  }
+
+  private collectBaselines(
+    dir: string,
+    inScope: PathSet,
+    allowDelete: boolean
+  ): void {
     for (const name of listDir(dir)) {
       if (name.endsWith(".json") || name.endsWith(".tmp")) {
         continue;
@@ -630,31 +918,26 @@ export class ChangeStore implements vscode.Disposable {
         }
         // Unusable: the content is there but nothing says which file it belongs
         // to. Leaving it would keep it forever, since nothing can ever match it.
-        this.log(`dropping orphaned baseline ${name} (no sidecar)`);
-        removeFile(contentPath);
+        // Foreign stores are another window's: do not delete there.
+        if (allowDelete) {
+          this.log(`dropping orphaned baseline ${name} (no sidecar)`);
+          removeFile(contentPath);
+        }
         continue;
       }
       if (!this.isInScope(sidecar.path)) {
-        // The hook captures whatever Claude touches; scoping is decided here.
-        // Dropping it is what the setting asked for, and a new baseline is
-        // captured from scratch if it is ever turned back on.
-        this.log(`dropping out-of-workspace baseline for ${sidecar.path}`);
-        removeFile(contentPath);
-        removeFile(sidecarPath(contentPath));
+        // Another window's folders or `trackOutsideWorkspace` — or a nested
+        // folder that now owns this path, if rehome has not run yet. Hide it
+        // here; do not delete it. The copy is the only pre-Claude original.
         continue;
       }
       if (this.isIgnored(sidecar.path)) {
-        // A rule was added after this baseline was captured, or the hook ran
-        // with rules older than the ones in force now. Either way the file is
-        // one the user asked not to have copied aside, so the copy goes.
-        this.log(`dropping ignored baseline for ${sidecar.path}`);
-        removeFile(contentPath);
-        removeFile(sidecarPath(contentPath));
+        // This window asked not to show the file. Another window — or this one
+        // after the rule is removed — may still need the recorded original.
         continue;
       }
-      paths.push({ path: sidecar.path, created: sidecar.created === true });
+      inScope.add(sidecar.path);
     }
-    return paths;
   }
 
   /**
@@ -1019,11 +1302,14 @@ export class ChangeStore implements vscode.Disposable {
 
   /** Re-read every known baseline from disk and recompute (used on load). */
   refreshFromDisk(): void {
+    // Nested-folder ownership can change between sweeps; move those copies
+    // before listing so we neither load a file we no longer own nor delete it.
+    this.rehomeDisplaced();
     // Before the baselines, because a staging is the one piece of state nothing
     // else revisits: a Pre hook whose Post never ran leaves the file's content
     // in `pending/` with no baseline and no entry pointing at it.
     this.sweepPendingState();
-    const seen = new Set<string>();
+    const seen = new PathSet();
     for (const entry of this.baselinePaths()) {
       seen.add(entry.path);
       if (entry.created) {
@@ -1034,14 +1320,15 @@ export class ChangeStore implements vscode.Disposable {
       this.tracked.delete(entry.path); // force a re-read of the baseline
       this.recompute(entry.path, /*silent*/ true);
     }
-    // Drop tracked entries whose baseline disappeared from disk.
+    // Drop tracked entries this store is no longer listing — baseline gone,
+    // or still on disk but out of this window's scope.
     for (const absPath of [...this.tracked.keys()]) {
       if (!seen.has(absPath)) {
         this.tracked.delete(absPath);
         this.userTouched.delete(absPath);
         this.createdFiles.delete(absPath);
-        // Its baseline is gone, so an open diff tab would quietly become a
-        // comparison of the file against itself.
+        // An open diff tab would quietly become a comparison of the file
+        // against itself.
         this.closeDiffTabs(absPath);
       }
     }
@@ -1056,11 +1343,21 @@ export class ChangeStore implements vscode.Disposable {
    * hundred full diffs per event, all on the extension host thread.
    */
   reloadBaseline(absPath: string): void {
-    if (!this.shouldTrack(absPath)) {
-      // The hook captured something we do not review — out of scope, or matched
-      // by an ignore rule it did not have yet. Drop it here as well as in the
-      // full sweep, or it sits in storage until the next one.
-      this.discardState(absPath);
+    if (!this.isInScope(absPath)) {
+      // Peer-owned: move the copy. Otherwise leave it — another window may
+      // still be reviewing this file.
+      this.rehomePath(absPath);
+      if (this.tracked.has(absPath)) {
+        this.tracked.delete(absPath);
+        this.userTouched.delete(absPath);
+        this.createdFiles.delete(absPath);
+        this.closeDiffTabs(absPath);
+        this.fire(vscode.Uri.file(absPath));
+      }
+      return;
+    }
+    if (this.isIgnored(absPath)) {
+      this.hideFromQueue(absPath);
       return;
     }
     // Dropping the entry is what makes `recompute` re-read the baseline — and
@@ -1301,14 +1598,12 @@ export class ChangeStore implements vscode.Disposable {
   /** Mark a path fully reviewed: delete its state and stop tracking it. */
   private resolve(absPath: string, silent = false): void {
     this.markStateWrite();
-    const baseline = this.baselinePath(absPath);
-    removeFile(baseline);
-    removeFile(sidecarPath(baseline));
-    // A staged pre-edit copy left behind by a Pre hook whose Post never ran
-    // would otherwise be promoted as the baseline for a much later edit.
-    const pending = this.pendingPath(absPath);
-    removeFile(pending);
-    removeFile(sidecarPath(pending));
+    const stores = this.relatedStores();
+    // Explicit Keep/Undo must clear the copy the user reviewed, including one
+    // inherited from a parent or nested store — otherwise the next refresh
+    // rediscovers it. Passive browsing never calls this.
+    removeStatePairs(absPath, stores, "baselines");
+    removeStatePairs(absPath, stores, "pending");
 
     this.tracked.delete(absPath);
     this.userTouched.delete(absPath);
@@ -1320,58 +1615,56 @@ export class ChangeStore implements vscode.Disposable {
   }
 
   /**
-   * Forget a path we are not reviewing after all, and everything recorded about
-   * it. Same disk work as {@link resolve} — the pre-Claude content is a copy of
-   * a file the user asked us not to hold, so it does not survive as "recovery
-   * data" the way a demoted baseline does.
+   * Stop listing a path without deleting its recorded original. Ignore rules
+   * in this window must not wipe a baseline another window still needs.
    */
-  private discardState(absPath: string): void {
-    if (this.hasBaseline(absPath)) {
-      this.log(`discarding recorded state for ${absPath}: not under review`);
+  private hideFromQueue(absPath: string, silent = false): void {
+    const wasTracked = this.tracked.delete(absPath);
+    this.userTouched.delete(absPath);
+    this.createdFiles.delete(absPath);
+    const wasUnreviewable = this.unreviewable.delete(absPath);
+    if (wasTracked || wasUnreviewable) {
+      this.closeDiffTabs(absPath);
+      if (!silent) {
+        this.fire(vscode.Uri.file(absPath));
+      }
     }
-    this.resolve(absPath, true);
   }
 
   /**
-   * Bring the queue and the state directory into line with the ignore rules,
-   * and report which files left the queue because of them.
+   * Bring the queue into line with the ignore rules, and report which files
+   * left it because of them.
    *
-   * A file that becomes ignored while it has changes waiting is dropped, and its
-   * baseline with it — so those changes are, in effect, kept. That is the honest
-   * reading of "stop looking at this file", but it is not something to do
-   * silently: the returned paths are what the caller names in the notification,
-   * and the command that adds a rule confirms first.
-   *
-   * The reverse does not restore anything. Once the recorded original is gone
-   * there is nothing to review against; the next edit Claude makes to the file
-   * starts it over.
+   * A file that becomes ignored while it has changes waiting leaves the queue;
+   * its baseline stays on disk. Removing the rule can bring the review back.
+   * The returned paths are what the caller names in the notification, and the
+   * command that adds a rule confirms first.
    */
   reconcileIgnored(): string[] {
     const left = [...this.tracked.keys()].filter((p) => this.isIgnored(p));
     for (const absPath of left) {
       this.log(`${absPath} is now ignored: leaving the review queue`);
-      this.resolve(absPath, true);
+      this.hideFromQueue(absPath, true);
     }
     for (const absPath of [...this.unreviewable.keys()]) {
       if (this.isIgnored(absPath)) {
         this.unreviewable.delete(absPath);
       }
     }
-    // Re-reads every baseline through the new rules — which is what drops the
-    // ones belonging to files that are now ignored — sweeps the stagings, and
-    // fires once at the end.
     this.refreshFromDisk();
     return left;
   }
 
   /**
-   * Drop pre-edit copies staged by the hook for files we are not reviewing.
+   * Drop or rehome pre-edit copies staged by the hook for files we are not
+   * reviewing.
    *
-   * `baselinePaths()` sweeps `baselines/`, and `resolve()` clears the staging of
+   * `baselinePaths()` lists `baselines/`, and `resolve()` clears the staging of
    * one path. Neither reaches a staging whose Post hook never ran: that file has
    * no baseline and no tracked entry, so nothing else would ever look at it
-   * again until the TTL, and until then it holds the verbatim content of a file
-   * the user excluded.
+   * again until the TTL. An ignored file's copy is left (this window's rules
+   * must not delete another window's staging); an out-of-scope copy is moved to
+   * the owning peer or left for another window. TTL still expires both.
    */
   private sweepPendingState(): void {
     const dir = pendingDir(this.stateDir);
@@ -1384,14 +1677,13 @@ export class ChangeStore implements vscode.Disposable {
       if (!sidecar) {
         continue;
       }
-      if (!this.shouldTrack(sidecar.path)) {
-        this.markStateWrite();
-        this.log(
-          `dropping the staged copy of ${sidecar.path}: not under review`
-        );
-        removeFile(contentPath);
-        removeFile(sidecarPath(contentPath));
-        continue;
+      if (!this.isInScope(sidecar.path)) {
+        this.rehomePath(sidecar.path);
+        if (!fileExists(contentPath)) {
+          continue;
+        }
+        // Still here: no peer in this window owns it. Expire on the TTL the
+        // same as an in-scope staging — do not delete just for being foreign.
       }
       // A staging whose Post phase never ran. Nothing else revisits these, so
       // one left behind is a verbatim copy of the user's source sitting on disk
@@ -1409,6 +1701,9 @@ export class ChangeStore implements vscode.Disposable {
       // could be recorded, and the file really did change. An Edit staging
       // expiring is the old, benign case — a denied tool call — and stays quiet.
       if (sidecar.ttlMs !== undefined && !this.hasBaseline(sidecar.path)) {
+        if (!this.isInScope(sidecar.path)) {
+          continue;
+        }
         this.log(
           `the copy staged for ${sidecar.path} expired before it was used`
         );
@@ -1474,7 +1769,8 @@ export class ChangeStore implements vscode.Disposable {
         if (
           input instanceof vscode.TabInputTextDiff &&
           input.original.scheme === BASELINE_SCHEME &&
-          input.modified.scheme === "file" &&
+          (input.modified.scheme === "file" ||
+            input.modified.scheme === CURRENT_SCHEME) &&
           input.modified.fsPath === absPath
         ) {
           stale.push(tab);

@@ -1,27 +1,22 @@
 import * as path from "path";
 import * as vscode from "vscode";
-import { ApplyResult, ChangeStore, UndoSnapshot } from "./changeStore";
-import { ensureDir, listDir, pathKey } from "./util";
+import { ApplyResult, ReviewStore, UndoSnapshot } from "./changeStore";
+import { ensureDir, listDir } from "./util";
 import { LineChange } from "./diff";
-import {
-  hooksState,
-  installHooksInteractive,
-  warnIfBashDetectionUnavailable,
-  maybePromptInstall,
-  repairHooksIfStale,
-} from "./detection/hookInstaller";
-import { HookState } from "./detection/hookSettings";
-import { KeepUndoWatcher } from "./detection/keepUndoWatcher";
-import { TranscriptWatcher } from "./detection/transcriptWatcher";
+import { installHooksInteractive } from "./detection/hookInstaller";
 import { IGNORE_FILE_NAME, IgnoreConfig } from "./ignoreConfig";
 import * as settings from "./settings";
+import { FolderSession, ReviewHub } from "./reviewHub";
 import { ChangeNode, ChangesView, ChangesViewProvider } from "./ui/changesView";
 import { ClaudeCodeActionProvider } from "./ui/codeActions";
 import { ClaudeCodeLensProvider } from "./ui/codeLens";
 import { CommentReviewController } from "./ui/commentReview";
 import {
   BASELINE_SCHEME,
+  CURRENT_SCHEME,
   BaselineContentProvider,
+  CurrentContentProvider,
+  diffModifiedUri,
   openClaudeDiff,
   toBaselineUri,
 } from "./ui/diffView";
@@ -30,7 +25,6 @@ import { Feedback, shortName } from "./ui/feedback";
 import { ClaudeFileDecorationProvider } from "./ui/fileDecorations";
 import { pluralChanges, pluralFiles } from "./ui/format";
 import { goToChange, goToHunk } from "./ui/navigation";
-import { ClaudeSourceControl, DoubledGutterNotice } from "./ui/quickDiff";
 import { PanelStatus, SettingsPanel } from "./ui/settingsPanel";
 import { ReviewStatusBar } from "./ui/statusBar";
 
@@ -45,8 +39,9 @@ let layoutController: DiffLayoutController | undefined;
 /**
  * What `vscode.extensions.getExtension(...).exports` yields. Small on purpose:
  * it exists so the integration tests can find the state directory, which now
- * lives in VS Code's per-workspace storage rather than at a path they could
- * derive themselves.
+ * lives under VS Code's global storage (`folders/<hash>`), keyed by folder path
+ * rather than by the window, so the same repo keeps its queue when opened
+ * alone or in another workspace.
  */
 export interface KeepUndoApi {
   readonly stateDir: string;
@@ -58,7 +53,7 @@ export interface KeepUndoApi {
    * them — above all "Undo deletes a file Claude created" — is only reachable
    * this way. Nothing in the extension consumes it.
    */
-  readonly store: ChangeStore;
+  readonly store: ReviewStore;
 }
 
 export function activate(
@@ -68,41 +63,35 @@ export function activate(
   context.subscriptions.push(output);
   const log = (msg: string) => output.appendLine(`[${ts()}] ${msg}`);
 
-  const folder = vscode.workspace.workspaceFolders?.[0];
-  if (!folder) {
-    log("No workspace folder open: extension inactive.");
-    return undefined;
+  const hub = new ReviewHub(context, log);
+  context.subscriptions.push(hub);
+  if (!vscode.workspace.workspaceFolders?.length) {
+    log("No workspace folder open yet; waiting for folders.");
   }
-  const workspaceRoot = folder.uri.fsPath;
-  log(`Active on ${workspaceRoot}`);
-
-  const stateDir = resolveStateDir(context, workspaceRoot);
-  ensureDir(stateDir);
-  log(`Review state: ${stateDir}`);
-  // Built before the store, which consults it on every path it is handed, and
-  // before the detectors, which must not read a file it excludes.
-  const ignoreConfig = new IgnoreConfig(workspaceRoot, stateDir, log);
-  context.subscriptions.push(ignoreConfig);
-  const store = new ChangeStore(stateDir, workspaceRoot, log, ignoreConfig);
-  context.subscriptions.push(store);
 
   // --- providers -----------------------------------------------------------
-  const baselineProvider = new BaselineContentProvider(store);
+  const baselineProvider = new BaselineContentProvider(hub);
+  const currentProvider = new CurrentContentProvider(hub);
   context.subscriptions.push(
     baselineProvider,
+    currentProvider,
     vscode.workspace.registerTextDocumentContentProvider(
       BASELINE_SCHEME,
       baselineProvider
+    ),
+    vscode.workspace.registerTextDocumentContentProvider(
+      CURRENT_SCHEME,
+      currentProvider
     )
   );
 
-  const decorations = new ClaudeFileDecorationProvider(store);
+  const decorations = new ClaudeFileDecorationProvider(hub);
   context.subscriptions.push(
     decorations,
     vscode.window.registerFileDecorationProvider(decorations)
   );
 
-  const codeLens = new ClaudeCodeLensProvider(store);
+  const codeLens = new ClaudeCodeLensProvider(hub);
   context.subscriptions.push(
     codeLens,
     vscode.languages.registerCodeLensProvider({ scheme: "file" }, codeLens)
@@ -112,48 +101,49 @@ export function activate(
   context.subscriptions.push(
     vscode.languages.registerCodeActionsProvider(
       { scheme: "file" },
-      new ClaudeCodeActionProvider(store),
+      new ClaudeCodeActionProvider(hub),
       ClaudeCodeActionProvider.metadata
     )
   );
 
-  // Gutter change bars in the real editor + the built-in quick diff peek widget
-  // (whose toolbar we fill through the `scm/change/title` menu), plus an
-  // optional Source Control entry listing the files awaiting review.
-  context.subscriptions.push(
-    new ClaudeSourceControl(folder, store),
-    new DoubledGutterNotice(workspaceRoot, store, context.workspaceState)
-  );
-
   // Optional inline comment threads: removed/added lines rendered *between* the
   // editor lines, with Keep/Undo in the thread toolbar.
-  context.subscriptions.push(new CommentReviewController(store));
+  context.subscriptions.push(new CommentReviewController(hub));
 
   // Show the Claude diff as a single-pane (inline) diff instead of a split.
   const diffLayout = new DiffLayoutController(context);
   layoutController = diffLayout;
   context.subscriptions.push(diffLayout);
 
-  const changesView = new ChangesViewProvider(store);
-  context.subscriptions.push(changesView, new ChangesView(store, changesView));
-  context.subscriptions.push(new ReviewStatusBar(store));
+  const changesView = new ChangesViewProvider(hub);
+  context.subscriptions.push(changesView, new ChangesView(hub, changesView));
+  context.subscriptions.push(new ReviewStatusBar(hub));
 
-  const feedback = new Feedback(store);
+  const feedback = new Feedback(hub);
   context.subscriptions.push(feedback);
 
-  const openDiff = (absPath: string, atLine?: number) =>
-    openClaudeDiff(absPath, {
+  const openDiff = (absPath: string, atLine?: number) => {
+    const wasTracked = hub.isTracked(absPath);
+    hub.recompute(absPath);
+    const tracked = hub.get(absPath);
+    if (!tracked) {
+      void vscode.window.showInformationMessage(
+        wasTracked
+          ? `${shortName(absPath)} is no longer different from the recorded original.`
+          : "No Claude changes to review for this file."
+      );
+      return Promise.resolve();
+    }
+    return openClaudeDiff(absPath, {
       atLine,
       onOpening: () => diffLayout.notifyOpening(),
-      siblings: store.getTracked().map((f) => f.path),
+      siblings: hub.getTracked().map((f) => f.path),
+      missing: tracked.missing,
     });
+  };
 
-  /**
-   * True while an ignore rule is being added through the command, which
-   * confirms its own consequences. The reconcile that follows then reports
-   * nothing: two messages about one deliberate action read as a warning.
-   */
-  let confirmedIgnoreChange = false;
+  const reviewTarget = (arg?: unknown): ReviewStore =>
+    hub.sessionFromArg(arg)?.store ?? hub;
 
   // --- commands ------------------------------------------------------------
   const report = (result: ApplyResult, action: string) => {
@@ -198,12 +188,67 @@ export function activate(
     run: () => Promise<ApplyResult>
   ) => {
     const snapshots = paths
-      .map((p) => store.captureUndoSnapshot(p))
+      .map((p) => hub.captureUndoSnapshot(p))
       .filter((s): s is UndoSnapshot => s !== undefined);
     if (report(await run(), "Undo")) {
       // Stamped after the undo landed: the record now knows what it left behind,
       // so a Restore fired much later can tell the file has moved on since.
-      feedback.undone(`Undid ${what}`, store.stampPostUndo(snapshots));
+      feedback.undone(`Undid ${what}`, hub.stampPostUndo(snapshots));
+    }
+  };
+
+  const keepAllIn = (target: ReviewStore) => {
+    const n = target.count();
+    target.keepAll();
+    if (n > 0) {
+      feedback.kept(`Kept Claude's changes in ${pluralFiles(n)}`);
+    }
+  };
+
+  const undoAllIn = async (target: ReviewStore) => {
+    if (target.count() === 0) {
+      return;
+    }
+    const paths = target.getTracked().map((f) => f.path);
+    if (!(await confirmDestructive(target, paths, "all"))) {
+      return;
+    }
+    const snapshots = paths
+      .map((p) => target.captureUndoSnapshot(p))
+      .filter((s): s is UndoSnapshot => s !== undefined);
+    // Exactly the set that was named in the confirmation and snapshotted.
+    // Re-reading the live tracked map here reverted files the user never
+    // confirmed — the watchers keep registering baselines while a modal is up —
+    // and deleted files Claude created with no deletion warning at all.
+    const { applied, reformatted, failed, deleted } =
+      await target.undoPaths(paths);
+    const done = applied + reformatted.length;
+    if (done > 0) {
+      // Armed before any failure is reported: the snapshots are valid for every
+      // path that really was overwritten, and one file the formatter touched used
+      // to cost the whole batch its Restore point.
+      const detail =
+        deleted.length > 0
+          ? `, deleting ${pluralFiles(deleted.length)} Claude created`
+          : "";
+      feedback.undone(
+        `Undid Claude's changes in ${pluralFiles(done)}${detail}`,
+        target.stampPostUndo(snapshots.filter((s) => !failed.includes(s.path)))
+      );
+    }
+    if (reformatted.length > 0) {
+      void vscode.window.showWarningMessage(
+        `${pluralFiles(reformatted.length)} ${
+          reformatted.length === 1 ? "was" : "were"
+        } restored but reformatted on save, so ${
+          reformatted.length === 1 ? "it is" : "they are"
+        } still under review.`
+      );
+    }
+    if (failed.length > 0) {
+      void vscode.window.showErrorMessage(
+        `${failed.length} of ${done + failed.length} files could not be restored. See the Claude Keep/Undo output channel.`
+      );
     }
   };
 
@@ -215,28 +260,34 @@ export function activate(
         if (!p) {
           return;
         }
-        if (!store.isTracked(p)) {
-          void vscode.window.showInformationMessage(
-            "No Claude changes to review for this file."
-          );
-          return;
-        }
         await openDiff(p, typeof line === "number" ? line : undefined);
       }
     ),
-    vscode.commands.registerCommand("claudeKeepUndo.openAllChanges", () =>
-      openAllChanges(store)
+    vscode.commands.registerCommand(
+      "claudeKeepUndo.openAllChanges",
+      (arg?: unknown) => openAllChanges(reviewTarget(arg))
+    ),
+    vscode.commands.registerCommand(
+      "claudeKeepUndo.openFolderChanges",
+      async (arg?: unknown) => {
+        const session =
+          hub.sessionFromArg(arg) ??
+          (await pickSession(hub, "Review Claude changes in which project?"));
+        if (session) {
+          await openAllChanges(session.store);
+        }
+      }
     ),
     vscode.commands.registerCommand(
       "claudeKeepUndo.keepHunk",
       (arg?: unknown, idx?: unknown, fingerprint?: unknown) => {
-        const h = resolveHunk(store, arg, idx, fingerprint);
+        const h = resolveHunk(hub, arg, idx, fingerprint);
         if (!h) {
           report("stale", "Keep");
           return;
         }
         keep(
-          store.keepHunk(h.path, h.index, h.fingerprint),
+          hub.keepHunk(h.path, h.index, h.fingerprint),
           `${pluralChanges(1)} in ${shortName(h.path)}`
         );
       }
@@ -244,7 +295,7 @@ export function activate(
     vscode.commands.registerCommand(
       "claudeKeepUndo.undoHunk",
       async (arg?: unknown, idx?: unknown, fingerprint?: unknown) => {
-        const h = resolveHunk(store, arg, idx, fingerprint);
+        const h = resolveHunk(hub, arg, idx, fingerprint);
         if (!h) {
           report("stale", "Undo");
           return;
@@ -252,13 +303,13 @@ export function activate(
         // On a file Claude created the baseline is empty, so undoing its only
         // hunk removes the file. That deserves the same confirmation the
         // file-level Undo gives it.
-        if (!(await confirmDestructive(store, [h.path], "change"))) {
+        if (!(await confirmDestructive(hub, [h.path], "change"))) {
           return;
         }
         await undo(
           [h.path],
           `${pluralChanges(1)} in ${shortName(h.path)}`,
-          () => store.undoHunk(h.path, h.index, h.fingerprint)
+          () => hub.undoHunk(h.path, h.index, h.fingerprint)
         );
       }
     ),
@@ -274,7 +325,7 @@ export function activate(
           return;
         }
         keep(
-          store.keepLineChange(c.path, c.change),
+          hub.keepLineChange(c.path, c.change),
           `${pluralChanges(1)} in ${shortName(c.path)}`
         );
       }
@@ -287,37 +338,37 @@ export function activate(
           report("stale", "Undo");
           return;
         }
-        if (!(await confirmDestructive(store, [c.path], "change"))) {
+        if (!(await confirmDestructive(hub, [c.path], "change"))) {
           return;
         }
         await undo(
           [c.path],
           `${pluralChanges(1)} in ${shortName(c.path)}`,
-          () => store.undoLineChange(c.path, c.change)
+          () => hub.undoLineChange(c.path, c.change)
         );
       }
     ),
     // Invoked from the line-number context menu with { lineNumber, uri }.
     vscode.commands.registerCommand(
       "claudeKeepUndo.keepAtLine",
-      (arg?: unknown) => keepResolved(resolveLineArg(store, arg))
+      (arg?: unknown) => keepResolved(resolveLineArg(hub, arg))
     ),
     vscode.commands.registerCommand(
       "claudeKeepUndo.undoAtLine",
-      (arg?: unknown) => undoResolved(resolveLineArg(store, arg))
+      (arg?: unknown) => undoResolved(resolveLineArg(hub, arg))
     ),
     // The keyboard path: same two actions, resolved from the caret.
     vscode.commands.registerCommand("claudeKeepUndo.keepAtCursor", () =>
-      keepResolved(resolveCursor(store))
+      keepResolved(resolveCursor(hub))
     ),
     vscode.commands.registerCommand("claudeKeepUndo.undoAtCursor", () =>
-      undoResolved(resolveCursor(store))
+      undoResolved(resolveCursor(hub))
     ),
     vscode.commands.registerCommand("claudeKeepUndo.nextChange", () =>
-      goToChange(store, 1)
+      goToChange(hub, 1)
     ),
     vscode.commands.registerCommand("claudeKeepUndo.previousChange", () =>
-      goToChange(store, -1)
+      goToChange(hub, -1)
     ),
     vscode.commands.registerCommand(
       "claudeKeepUndo.gotoHunk",
@@ -326,7 +377,7 @@ export function activate(
           return;
         }
         goToHunk(
-          store,
+          hub,
           absPath,
           index,
           typeof fingerprint === "string" ? fingerprint : undefined
@@ -340,12 +391,12 @@ export function activate(
         if (!p) {
           return;
         }
-        if (!store.isTracked(p)) {
+        if (!hub.isTracked(p)) {
           report("unavailable", "Keep");
           return;
         }
-        const count = store.get(p)?.hunks.length ?? 0;
-        store.keepFile(p);
+        const count = hub.get(p)?.hunks.length ?? 0;
+        hub.keepFile(p);
         feedback.kept(`Kept ${pluralChanges(count)} in ${shortName(p)}`);
       }
     ),
@@ -356,79 +407,57 @@ export function activate(
         if (!p) {
           return;
         }
-        if (!store.isTracked(p)) {
+        if (!hub.isTracked(p)) {
           report("unavailable", "Undo");
           return;
         }
-        if (!(await confirmDestructive(store, [p], "file"))) {
+        if (!(await confirmDestructive(hub, [p], "file"))) {
           return;
         }
-        const count = store.get(p)?.hunks.length ?? 0;
+        const count = hub.get(p)?.hunks.length ?? 0;
         await undo([p], `${pluralChanges(count)} in ${shortName(p)}`, () =>
-          store.undoFile(p)
+          hub.undoFile(p)
         );
       }
     ),
-    vscode.commands.registerCommand("claudeKeepUndo.keepAll", () => {
-      const n = store.count();
-      store.keepAll();
-      if (n > 0) {
-        feedback.kept(`Kept Claude's changes in ${pluralFiles(n)}`);
+    vscode.commands.registerCommand("claudeKeepUndo.keepAll", (arg?: unknown) =>
+      keepAllIn(reviewTarget(arg))
+    ),
+    vscode.commands.registerCommand(
+      "claudeKeepUndo.keepFolder",
+      async (arg?: unknown) => {
+        const session =
+          hub.sessionFromArg(arg) ??
+          (await pickSession(hub, "Keep all Claude changes in which project?"));
+        if (session) {
+          keepAllIn(session.store);
+        }
       }
-    }),
-    vscode.commands.registerCommand("claudeKeepUndo.undoAll", async () => {
-      if (store.count() === 0) {
-        return;
+    ),
+    vscode.commands.registerCommand("claudeKeepUndo.undoAll", (arg?: unknown) =>
+      undoAllIn(reviewTarget(arg))
+    ),
+    vscode.commands.registerCommand(
+      "claudeKeepUndo.undoFolder",
+      async (arg?: unknown) => {
+        const session =
+          hub.sessionFromArg(arg) ??
+          (await pickSession(hub, "Undo all Claude changes in which project?"));
+        if (session) {
+          await undoAllIn(session.store);
+        }
       }
-      const paths = store.getTracked().map((f) => f.path);
-      if (!(await confirmDestructive(store, paths, "all"))) {
-        return;
-      }
-      const snapshots = paths
-        .map((p) => store.captureUndoSnapshot(p))
-        .filter((s): s is UndoSnapshot => s !== undefined);
-      // Exactly the set that was named in the confirmation and snapshotted.
-      // Re-reading the live tracked map here reverted files the user never
-      // confirmed — the watchers keep registering baselines while a modal is up —
-      // and deleted files Claude created with no deletion warning at all.
-      const { applied, reformatted, failed, deleted } =
-        await store.undoPaths(paths);
-      const done = applied + reformatted.length;
-      if (done > 0) {
-        // Armed before any failure is reported: the snapshots are valid for every
-        // path that really was overwritten, and one file the formatter touched used
-        // to cost the whole batch its Restore point.
-        const detail =
-          deleted.length > 0
-            ? `, deleting ${pluralFiles(deleted.length)} Claude created`
-            : "";
-        feedback.undone(
-          `Undid Claude's changes in ${pluralFiles(done)}${detail}`,
-          store.stampPostUndo(snapshots.filter((s) => !failed.includes(s.path)))
-        );
-      }
-      if (reformatted.length > 0) {
-        void vscode.window.showWarningMessage(
-          `${pluralFiles(reformatted.length)} ${
-            reformatted.length === 1 ? "was" : "were"
-          } restored but reformatted on save, so ${
-            reformatted.length === 1 ? "it is" : "they are"
-          } still under review.`
-        );
-      }
-      if (failed.length > 0) {
-        void vscode.window.showErrorMessage(
-          `${failed.length} of ${done + failed.length} files could not be restored. See the Claude Keep/Undo output channel.`
-        );
-      }
-    }),
+    ),
     vscode.commands.registerCommand("claudeKeepUndo.restoreLastUndo", () =>
       feedback.restore()
     ),
-    vscode.commands.registerCommand("claudeKeepUndo.installHooks", () => {
-      installHooksInteractive(workspaceRoot, context.extensionPath, stateDir);
-      refreshHookContext();
-    }),
+    vscode.commands.registerCommand(
+      "claudeKeepUndo.installHooks",
+      async (arg?: unknown) => {
+        await installHooksCommand(hub, context, arg);
+        refreshHookContext();
+      }
+    ),
     vscode.commands.registerCommand("claudeKeepUndo.openSettings", () =>
       SettingsPanel.show(context, panelStatus, statusChanged.event)
     ),
@@ -440,11 +469,11 @@ export function activate(
       )
     ),
     vscode.commands.registerCommand("claudeKeepUndo.refresh", () => {
-      store.refreshFromDisk();
+      hub.refreshFromDisk();
       refreshHookContext();
     }),
     vscode.commands.registerCommand("claudeKeepUndo.editIgnoreFile", () =>
-      ignoreConfig.openIgnoreFile()
+      editIgnoreFile(hub)
     ),
     vscode.commands.registerCommand(
       "claudeKeepUndo.ignorePath",
@@ -456,34 +485,26 @@ export function activate(
           );
           return;
         }
+        const ignore = hub.ignoreFor(p);
+        if (!ignore) {
+          void vscode.window.showInformationMessage(
+            "Open a folder to add ignore rules."
+          );
+          return;
+        }
         // Suppresses the notification the reconcile would otherwise raise: the
         // modal below has already said, in more detail, what this does.
-        confirmedIgnoreChange = true;
+        hub.beginConfirmedIgnore();
         try {
-          await addIgnoreRule(store, ignoreConfig, p);
+          await addIgnoreRule(hub, ignore, p);
         } finally {
-          confirmedIgnoreChange = false;
+          hub.endConfirmedIgnore();
         }
       }
     ),
-    vscode.commands.registerCommand("claudeKeepUndo.revealSnapshots", () => {
-      // The directory is created lazily by the first snapshot, so before any
-      // Undo this command used to reveal a path that does not exist — which on
-      // macOS does nothing at all, and reads as a broken safety net.
-      const dir = store.snapshotsLocation();
-      ensureDir(dir);
-      const count = listDir(dir).filter((n) => !n.endsWith(".json")).length;
-      if (count === 0) {
-        void vscode.window.showInformationMessage(
-          "No recovery snapshots yet. One is saved automatically before every Undo."
-        );
-        return;
-      }
-      void vscode.commands.executeCommand(
-        "revealFileInOS",
-        vscode.Uri.file(dir)
-      );
-    })
+    vscode.commands.registerCommand("claudeKeepUndo.revealSnapshots", () =>
+      revealSnapshots(hub)
+    )
   );
 
   /** Keep / Undo from a resolved line or caret position, with its excuses. */
@@ -493,7 +514,7 @@ export function activate(
       return;
     }
     keep(
-      store.keepHunk(ref.path, ref.index, ref.fingerprint),
+      hub.keepHunk(ref.path, ref.index, ref.fingerprint),
       `${pluralChanges(1)} in ${shortName(ref.path)}`
     );
   }
@@ -505,20 +526,20 @@ export function activate(
       void vscode.window.showInformationMessage(explainNoHunk(ref));
       return;
     }
-    if (!(await confirmDestructive(store, [ref.path], "change"))) {
+    if (!(await confirmDestructive(hub, [ref.path], "change"))) {
       return;
     }
     await undo(
       [ref.path],
       `${pluralChanges(1)} in ${shortName(ref.path)}`,
-      () => store.undoHunk(ref.path, ref.index, ref.fingerprint)
+      () => hub.undoHunk(ref.path, ref.index, ref.fingerprint)
     );
   }
 
   // --- live recompute on edits/saves --------------------------------------
   const debouncers = new Map<string, NodeJS.Timeout>();
   const scheduleRecompute = (fsPath: string) => {
-    if (!store.isTracked(fsPath)) {
+    if (!hub.isTracked(fsPath)) {
       return;
     }
     const prev = debouncers.get(fsPath);
@@ -529,7 +550,7 @@ export function activate(
       fsPath,
       setTimeout(() => {
         debouncers.delete(fsPath);
-        store.recompute(fsPath);
+        hub.recompute(fsPath);
       }, 200)
     );
   };
@@ -549,8 +570,8 @@ export function activate(
       // the dirty flag is set. Requiring both at once — which is what the single
       // guard above this used to do — meant the opening edit of every editing
       // session went unrecorded, and with it the flag that makes Undo ask first.
-      if (e.document.isDirty && !store.isApplyingEdit()) {
-        store.noteUserEdit(e.document.uri.fsPath);
+      if (e.document.isDirty && !hub.isApplyingEdit()) {
+        hub.noteUserEdit(e.document.uri.fsPath);
       }
       if (e.contentChanges.length > 0) {
         scheduleRecompute(e.document.uri.fsPath);
@@ -558,7 +579,7 @@ export function activate(
     }),
     vscode.workspace.onDidSaveTextDocument((doc) => {
       if (doc.uri.scheme === "file") {
-        store.recompute(doc.uri.fsPath);
+        hub.recompute(doc.uri.fsPath);
       }
     })
   );
@@ -567,41 +588,23 @@ export function activate(
   const statusChanged = new vscode.EventEmitter<void>();
   context.subscriptions.push(statusChanged);
 
-  // Reading the registration means parsing a file the user hand-edits, so every
-  // read is guarded: an unexpected shape must not be able to break the status bar,
-  // the menus or the settings panel.
-  const currentHookState = (): HookState => {
-    try {
-      return hooksState(
-        workspaceRoot,
-        context.extensionPath,
-        stateDir,
-        settings.bashChanges()
-      );
-    } catch (err) {
-      log(`could not read the hook registration: ${String(err)}`);
-      return "missing";
-    }
-  };
-
   const panelStatus = (): PanelStatus => ({
-    hooks: currentHookState(),
+    hooks: hub.aggregatedHookState(),
     hooksEnabled: settings.useHooks(),
     transcriptEnabled: settings.useTranscript(),
-    pendingFiles: store.count(),
-    pendingChanges: store
+    pendingFiles: hub.count(),
+    pendingChanges: hub
       .getTracked()
       .reduce((total, file) => total + file.hunks.length, 0),
-    unreviewable: store.getUnreviewable().length,
-    ignoreRules: ignoreConfig.patternCount(),
+    unreviewable: hub.getUnreviewable().length,
+    ignoreRules: hub.patternCount(),
   });
 
   const refreshHookContext = () => {
-    const installed = currentHookState() === "ok";
     void vscode.commands.executeCommand(
       "setContext",
       HOOKS_INSTALLED_KEY,
-      installed
+      hub.hooksInstalledEverywhere()
     );
     statusChanged.fire();
   };
@@ -612,12 +615,12 @@ export function activate(
     void vscode.commands.executeCommand(
       "setContext",
       ACTIVE_TRACKED_KEY,
-      !!fsPath && store.isTracked(fsPath)
+      !!fsPath && hub.isTracked(fsPath)
     );
     void vscode.commands.executeCommand(
       "setContext",
       HAS_CHANGES_KEY,
-      store.count() > 0
+      hub.count() > 0
     );
   };
 
@@ -631,14 +634,10 @@ export function activate(
   context.subscriptions.push(
     // A rule can start matching files that are already in the queue — the user
     // edited `.keepundoignore` by hand, pulled a colleague's, or changed a
-    // setting. Those files leave the queue and their recorded originals are
-    // deleted, so the change is announced rather than simply happening.
-    ignoreConfig.onDidChange(() => {
-      const left = store.reconcileIgnored();
+    // setting. Those files leave this window's queue; the recorded originals
+    // stay, so the change is announced rather than simply happening.
+    hub.onDidDropIgnored((left) => {
       statusChanged.fire();
-      if (left.length === 0 || confirmedIgnoreChange) {
-        return;
-      }
       void vscode.window
         .showInformationMessage(
           `${pluralFiles(left.length)} left the review queue: ${
@@ -654,39 +653,44 @@ export function activate(
           }
         });
     }),
+    hub.onDidSessionsChange(refreshHookContext),
     vscode.window.onDidChangeActiveTextEditor(updateActiveContext),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("claudeKeepUndo.explorerContextMenu")) {
         updateMenuContext();
       }
+      if (
+        e.affectsConfiguration("claudeKeepUndo.detection.useHooks") ||
+        e.affectsConfiguration("claudeKeepUndo.detection.bashChanges") ||
+        e.affectsConfiguration("claudeKeepUndo.detection.useTranscript")
+      ) {
+        hub.syncDetectors();
+        statusChanged.fire();
+      }
       if (settings.affectsUs(e)) {
         statusChanged.fire();
       }
-    }),
-    // The hooks live in a file Claude Code, the user and we all write to, so the
-    // welcome view's "install" button has to follow it rather than a snapshot
-    // taken at activation.
-    watchHookSettings(folder, refreshHookContext)
+    })
   );
   updateActiveContext(); // the first editor is already open at activation time
   updateMenuContext();
 
   const opened = new Set<string>();
   context.subscriptions.push(
-    store.onDidChange((uri) => {
+    hub.onDidChange((uri) => {
       updateActiveContext();
       statusChanged.fire();
       if (!uri) {
         // Bulk change: forget every path that is no longer pending, so a later
         // edit to the same file can auto-open again.
         for (const fsPath of [...opened]) {
-          if (!store.isTracked(fsPath)) {
+          if (!hub.isTracked(fsPath)) {
             opened.delete(fsPath);
           }
         }
         return;
       }
-      if (!store.isTracked(uri.fsPath)) {
+      if (!hub.isTracked(uri.fsPath)) {
         opened.delete(uri.fsPath);
       }
     }),
@@ -696,7 +700,7 @@ export function activate(
     // writing the file. Driving auto-open from it meant that after any window
     // reload with pending changes, the first character the user typed in a tracked
     // file opened a diff tab and took the focus mid-sentence.
-    store.onDidDetect((uri) => {
+    hub.onDidDetect((uri) => {
       const fsPath = uri.fsPath;
       if (!settings.autoOpenDiff() || opened.has(fsPath)) {
         return;
@@ -716,125 +720,10 @@ export function activate(
     },
   });
 
-  // --- detection -----------------------------------------------------------
-  store.refreshFromDisk(); // load baselines left by hooks or a previous session
-
-  // Both detectors follow their setting for the life of the window. They used to
-  // be constructed inside one-shot `if` blocks at activation and never
-  // reconciled, so turning either one off left it running — still polling, still
-  // pushing entries into the changes view — while the extension's own settings
-  // panel, which reads both values live, drew a chip saying it was off. Turning
-  // one on did nothing at all until a reload, with no hint that one was needed.
-  let hookWatcher: KeepUndoWatcher | undefined;
-  let transcript: TranscriptWatcher | undefined;
-
-  const syncDetectors = (): void => {
-    if (settings.useHooks() && hookWatcher) {
-      // Already running, but the registration may no longer match what the
-      // settings ask for: the Bash tier travels inside the recorded command, so
-      // changing it makes the installed hook stale. Without this the setting
-      // appears to do nothing until the window is reloaded — the same trap
-      // documented for trackOutsideWorkspace.
-      try {
-        repairHooksIfStale(
-          workspaceRoot,
-          context.extensionPath,
-          stateDir,
-          settings.bashChanges(),
-          log,
-          context.workspaceState
-        );
-      } catch (err) {
-        log(`could not inspect the hook registration: ${String(err)}`);
-      }
-    }
-    if (settings.useHooks() && !hookWatcher) {
-      hookWatcher = new KeepUndoWatcher(stateDir, store);
-      // An extension update moves the install directory, which silently breaks
-      // the recorded hook command. Repair it before reporting the state.
-      //
-      // Guarded because this parses a file the user hand-edits, and it used to be
-      // able to throw on valid JSON in an unexpected shape — aborting activation
-      // after the detection watchers were registered but before the menus, the
-      // status bar and the returned API, which took the transcript channel down
-      // with it even though that channel does not involve hooks at all.
-      let state: HookState = "missing";
-      try {
-        state = repairHooksIfStale(
-          workspaceRoot,
-          context.extensionPath,
-          stateDir,
-          settings.bashChanges(),
-          log,
-          context.workspaceState
-        );
-      } catch (err) {
-        log(`could not inspect the hook registration: ${String(err)}`);
-      }
-      log(
-        state === "ok"
-          ? "Hooks detected: real-time detection active."
-          : `Hooks not active (${state}).`
-      );
-      // Separate question from whether the hooks are registered: they can be
-      // installed and working while shell-command detection still captures
-      // nothing, because that half is worked out from Git. Asked once, and off
-      // the activation path — it spawns a process.
-      if (state === "ok") {
-        void warnIfBashDetectionUnavailable(
-          workspaceRoot,
-          settings.bashChanges(),
-          log,
-          context.workspaceState
-        );
-      }
-    } else if (!settings.useHooks() && hookWatcher) {
-      hookWatcher.dispose();
-      hookWatcher = undefined;
-      log("Hook watcher stopped.");
-    }
-
-    if (settings.useTranscript() && !transcript) {
-      transcript = new TranscriptWatcher(workspaceRoot, store, log);
-      transcript.start();
-      log("Transcript watcher started.");
-    } else if (!settings.useTranscript() && transcript) {
-      transcript.dispose();
-      transcript = undefined;
-      // Its `dispose` only stops its own timers. The unreviewable entries it
-      // pushed into the store stay in the changes view otherwise — which is
-      // exactly the noise someone turning the reader off is trying to escape.
-      store.clearUnreviewable();
-      log("Transcript watcher stopped.");
-    }
-  };
-
-  syncDetectors();
-  context.subscriptions.push(
-    vscode.workspace.onDidChangeConfiguration((e) => {
-      if (
-        e.affectsConfiguration("claudeKeepUndo.detection.useHooks") ||
-        e.affectsConfiguration("claudeKeepUndo.detection.bashChanges") ||
-        e.affectsConfiguration("claudeKeepUndo.detection.useTranscript")
-      ) {
-        syncDetectors();
-        statusChanged.fire();
-      }
-    }),
-    {
-      dispose() {
-        hookWatcher?.dispose();
-        transcript?.dispose();
-      },
-    }
-  );
-
   refreshHookContext();
-  void maybePromptInstall(context, workspaceRoot, stateDir).then(
-    refreshHookContext
-  );
+  void hub.promptInstallHooks().then(refreshHookContext);
 
-  return { stateDir, store };
+  return { stateDir: hub.stateDir, store: hub };
 }
 
 export async function deactivate(): Promise<void> {
@@ -843,29 +732,6 @@ export async function deactivate(): Promise<void> {
   // global settings permanently altered.
   await layoutController?.flush();
   layoutController = undefined;
-}
-
-/** Watch the two files a hook registration can live in. */
-function watchHookSettings(
-  folder: vscode.WorkspaceFolder,
-  onChange: () => void
-): vscode.Disposable {
-  const watcher = vscode.workspace.createFileSystemWatcher(
-    new vscode.RelativePattern(folder, ".claude/settings*.json")
-  );
-  const listeners = [
-    watcher.onDidCreate(onChange),
-    watcher.onDidChange(onChange),
-    watcher.onDidDelete(onChange),
-  ];
-  return {
-    dispose() {
-      for (const l of listeners) {
-        l.dispose();
-      }
-      watcher.dispose();
-    },
-  };
 }
 
 function explainNoHunk(ref: "baseline-side" | undefined): string {
@@ -881,12 +747,12 @@ function explainNoHunk(ref: "baseline-side" | undefined): string {
  * take files out of the review queue.
  *
  * That confirmation is the whole reason this is not a one-liner. Excluding a
- * file with changes waiting deletes its recorded original, which is what makes
- * those changes permanent — the same outcome as Keep, reached from a menu item
- * that does not say so.
+ * file with changes waiting takes it out of this window's queue. The recorded
+ * original stays, so another window is not wiped and removing the rule can
+ * restore the review.
  */
 async function addIgnoreRule(
-  store: ChangeStore,
+  store: ReviewStore,
   ignore: IgnoreConfig,
   absPath: string
 ): Promise<void> {
@@ -930,8 +796,9 @@ async function addIgnoreRule(
       {
         modal: true,
         detail:
-          `${waiting} Those changes will be kept, and the recorded originals ` +
-          "deleted — after this they can no longer be undone.\n\n" +
+          `${waiting} Those changes leave this window's review queue. The ` +
+          "recorded originals stay on disk, so another window is not wiped " +
+          "and removing the rule can bring the review back.\n\n" +
           `The rule \`${pattern}\` is added to ${IGNORE_FILE_NAME}, where you can remove it again.`,
       },
       "Add Rule"
@@ -977,7 +844,7 @@ type UndoScope = "change" | "file" | "all";
  * mistake before it happens.
  */
 async function confirmDestructive(
-  store: ChangeStore,
+  store: ReviewStore,
   paths: string[],
   scope: UndoScope
 ): Promise<boolean> {
@@ -1111,7 +978,10 @@ function unriskyPrompt(
  * `vscode.changes` command, whose resource list is `[label, original, modified]`
  * triples.
  */
-async function openAllChanges(store: ChangeStore): Promise<void> {
+async function openAllChanges(store: ReviewStore): Promise<void> {
+  for (const file of store.getTracked()) {
+    store.recompute(file.path);
+  }
   const tracked = store.getTracked();
   if (tracked.length === 0) {
     void vscode.window.showInformationMessage("No Claude changes to review.");
@@ -1121,7 +991,7 @@ async function openAllChanges(store: ChangeStore): Promise<void> {
     (file) => [
       vscode.Uri.file(file.path),
       toBaselineUri(file.path),
-      vscode.Uri.file(file.path),
+      diffModifiedUri(file.path, file.missing),
     ]
   );
   const title = `Claude: ${pluralFiles(tracked.length)} to review`;
@@ -1136,28 +1006,159 @@ async function openAllChanges(store: ChangeStore): Promise<void> {
 
 // --- argument resolution ---------------------------------------------------
 
-/**
- * Where the review state lives: VS Code's per-workspace storage, outside the
- * repository. `storageUri` is undefined only without a workspace, which is
- * already ruled out; the global-storage fallback keeps the code total.
- */
-function resolveStateDir(
-  context: vscode.ExtensionContext,
-  workspaceRoot: string
-): string {
-  return (
-    context.storageUri?.fsPath ??
-    path.join(
-      context.globalStorageUri.fsPath,
-      "workspaces",
-      pathKey(workspaceRoot)
-    )
+async function pickSession(
+  hub: ReviewHub,
+  placeHolder: string
+): Promise<FolderSession | undefined> {
+  const folders = hub.getFolders();
+  if (folders.length === 0) {
+    return undefined;
+  }
+  if (folders.length === 1) {
+    return folders[0];
+  }
+  const picked = await vscode.window.showQuickPick(
+    folders.map((session) => ({
+      label: session.name,
+      description: session.root,
+      session,
+    })),
+    { placeHolder }
   );
+  return picked?.session;
+}
+
+async function installHooksCommand(
+  hub: ReviewHub,
+  context: vscode.ExtensionContext,
+  arg: unknown
+): Promise<void> {
+  const fromArg =
+    hub.sessionFromArg(arg) ??
+    (explicitPath(arg) ? hub.sessionForPath(explicitPath(arg)!) : undefined);
+  if (fromArg) {
+    installHooksInteractive(
+      fromArg.root,
+      context.extensionPath,
+      fromArg.stateDir
+    );
+    return;
+  }
+  const folders = hub.getFolders();
+  if (folders.length === 0) {
+    void vscode.window.showInformationMessage(
+      "Open a folder to install Claude Code hooks."
+    );
+    return;
+  }
+  if (folders.length === 1) {
+    installHooksInteractive(
+      folders[0].root,
+      context.extensionPath,
+      folders[0].stateDir
+    );
+    return;
+  }
+  const items: {
+    label: string;
+    description: string;
+    session: FolderSession | "all";
+  }[] = [
+    ...folders.map((session) => ({
+      label: session.name,
+      description: session.root,
+      session,
+    })),
+    {
+      label: "All projects",
+      description: "Install hooks in every workspace folder",
+      session: "all",
+    },
+  ];
+  const picked = await vscode.window.showQuickPick(items, {
+    placeHolder: "Install Claude Code hooks in which project?",
+  });
+  if (!picked) {
+    return;
+  }
+  const targets = picked.session === "all" ? folders : [picked.session];
+  for (const session of targets) {
+    installHooksInteractive(
+      session.root,
+      context.extensionPath,
+      session.stateDir
+    );
+  }
+}
+
+async function editIgnoreFile(hub: ReviewHub): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+  const fsPath = editor ? trackablePath(editor.document.uri) : undefined;
+  const fromEditor = fsPath ? hub.sessionForPath(fsPath) : undefined;
+  const session =
+    fromEditor ??
+    (await pickSession(hub, "Edit ignore rules for which project?"));
+  await session?.ignore.openIgnoreFile();
+}
+
+async function revealSnapshots(hub: ReviewHub): Promise<void> {
+  const session = await pickSession(
+    hub,
+    "Reveal recovery snapshots for which project?"
+  );
+  if (!session) {
+    return;
+  }
+  // The directory is created lazily by the first snapshot, so before any
+  // Undo this command used to reveal a path that does not exist — which on
+  // macOS does nothing at all, and reads as a broken safety net.
+  const dir = session.store.snapshotsLocation();
+  ensureDir(dir);
+  const count = listDir(dir).filter((n) => !n.endsWith(".json")).length;
+  if (count === 0) {
+    void vscode.window.showInformationMessage(
+      "No recovery snapshots yet. One is saved automatically before every Undo."
+    );
+    return;
+  }
+  void vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(dir));
+}
+
+/** Path from a command argument, without falling back to the active editor. */
+function explicitPath(arg: unknown): string | undefined {
+  if (arg === undefined) {
+    return undefined;
+  }
+  if (typeof arg === "string") {
+    return arg;
+  }
+  const direct = toUri(arg);
+  if (direct) {
+    return trackablePath(direct) ?? direct.fsPath;
+  }
+  if (isRecord(arg)) {
+    const resource = toUri(arg.resourceUri);
+    if (resource) {
+      return resource.fsPath;
+    }
+    const owner = toUri(arg.uri);
+    if (owner) {
+      return trackablePath(owner) ?? owner.fsPath;
+    }
+    if (isChangeNode(arg)) {
+      return arg.path;
+    }
+  }
+  return undefined;
 }
 
 /** The real file path behind a uri, including the baseline side of our diff. */
 function trackablePath(uri: vscode.Uri): string | undefined {
-  if (uri.scheme === "file" || uri.scheme === BASELINE_SCHEME) {
+  if (
+    uri.scheme === "file" ||
+    uri.scheme === BASELINE_SCHEME ||
+    uri.scheme === CURRENT_SCHEME
+  ) {
     return uri.fsPath;
   }
   return undefined;
@@ -1226,7 +1227,7 @@ interface HunkRef {
 }
 
 function resolveHunk(
-  store: ChangeStore,
+  store: ReviewStore,
   arg: unknown,
   idx: unknown,
   fingerprint: unknown
@@ -1252,7 +1253,7 @@ function resolveHunk(
 
 /** Resolve the hunk at a 0-based line, carrying its current fingerprint. */
 function atLine(
-  store: ChangeStore,
+  store: ReviewStore,
   path: string,
   line: number
 ): HunkRef | undefined {
@@ -1278,7 +1279,7 @@ function atLine(
  * index was resolved, so it always agrees with the wrong answer).
  */
 function resolveLineArg(
-  store: ChangeStore,
+  store: ReviewStore,
   arg: unknown
 ): HunkRef | "baseline-side" | undefined {
   if (!isRecord(arg) || typeof arg.lineNumber !== "number") {
@@ -1299,7 +1300,7 @@ function resolveLineArg(
 
 /** The change under the caret of the active editor, for the keyboard path. */
 function resolveCursor(
-  store: ChangeStore
+  store: ReviewStore
 ): HunkRef | "baseline-side" | undefined {
   const editor = vscode.window.activeTextEditor;
   if (!editor) {
@@ -1370,7 +1371,9 @@ function asCommentThread(
   return { path, line };
 }
 
-function isChangeNode(arg: unknown): arg is ChangeNode {
+function isChangeNode(
+  arg: unknown
+): arg is Exclude<ChangeNode, { type: "folder" }> {
   return (
     isRecord(arg) &&
     "type" in arg &&

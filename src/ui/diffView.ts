@@ -1,9 +1,9 @@
 import * as path from "path";
 import * as vscode from "vscode";
-import { ChangeStore } from "../changeStore";
-import { BASELINE_SCHEME } from "../util";
+import { ReviewStore } from "../changeStore";
+import { BASELINE_SCHEME, CURRENT_SCHEME } from "../util";
 
-export { BASELINE_SCHEME } from "../util";
+export { BASELINE_SCHEME, CURRENT_SCHEME } from "../util";
 
 /**
  * Build the left-hand (baseline) URI for a real file path.
@@ -21,6 +21,20 @@ export function fromBaselineUri(uri: vscode.Uri): string {
   return uri.fsPath;
 }
 
+/** Right-hand URI for a file Claude deleted: empty, but still named. */
+export function toCurrentUri(absPath: string): vscode.Uri {
+  return vscode.Uri.file(absPath).with({ scheme: CURRENT_SCHEME });
+}
+
+export function fromCurrentUri(uri: vscode.Uri): string {
+  return uri.fsPath;
+}
+
+/** The modified side of a Claude diff: the real file, or empty if it is gone. */
+export function diffModifiedUri(absPath: string, missing: boolean): vscode.Uri {
+  return missing ? toCurrentUri(absPath) : vscode.Uri.file(absPath);
+}
+
 /**
  * Serves the recorded baseline content for the left side of the diff editor.
  * Refreshes whenever a Keep folds a change into the baseline.
@@ -32,7 +46,7 @@ export class BaselineContentProvider
   readonly onDidChange = this._onDidChange.event;
   private readonly listener: vscode.Disposable;
 
-  constructor(private readonly store: ChangeStore) {
+  constructor(private readonly store: ReviewStore) {
     this.listener = store.onDidChange((uri) => {
       if (uri) {
         this._onDidChange.fire(toBaselineUri(uri.fsPath));
@@ -59,6 +73,42 @@ export class BaselineContentProvider
   }
 }
 
+/**
+ * Serves the right-hand side of a Claude diff when the file has been deleted.
+ * Always empty: the file is gone, and Keep/Undo act on the path, not this
+ * buffer.
+ */
+export class CurrentContentProvider
+  implements vscode.TextDocumentContentProvider, vscode.Disposable
+{
+  private readonly _onDidChange = new vscode.EventEmitter<vscode.Uri>();
+  readonly onDidChange = this._onDidChange.event;
+  private readonly listener: vscode.Disposable;
+
+  constructor(store: ReviewStore) {
+    this.listener = store.onDidChange((uri) => {
+      if (uri) {
+        this._onDidChange.fire(toCurrentUri(uri.fsPath));
+        return;
+      }
+      for (const doc of vscode.workspace.textDocuments) {
+        if (doc.uri.scheme === CURRENT_SCHEME) {
+          this._onDidChange.fire(doc.uri);
+        }
+      }
+    });
+  }
+
+  provideTextDocumentContent(_uri: vscode.Uri): string {
+    return "";
+  }
+
+  dispose(): void {
+    this.listener.dispose();
+    this._onDidChange.dispose();
+  }
+}
+
 export interface OpenDiffOptions {
   /** Scroll to this 0-based line once the diff is open. */
   atLine?: number;
@@ -69,6 +119,8 @@ export interface OpenDiffOptions {
    * alone is enough to tell this tab apart from its neighbours.
    */
   siblings?: string[];
+  /** The file is gone: open an empty virtual right-hand side, not `file:`. */
+  missing?: boolean;
 }
 
 /**
@@ -81,9 +133,9 @@ export async function openClaudeDiff(
   absPath: string,
   options: OpenDiffOptions = {}
 ): Promise<void> {
-  const { atLine, onOpening, siblings } = options;
+  const { atLine, onOpening, siblings, missing } = options;
   const left = toBaselineUri(absPath);
-  const right = vscode.Uri.file(absPath);
+  const right = diffModifiedUri(absPath, missing === true);
   await onOpening?.();
 
   // Pre-warm CodeLens computation so the diff opens with the Keep/Undo lenses
@@ -91,22 +143,25 @@ export async function openClaudeDiff(
   // VS Code computes CodeLens asynchronously after the editor mounts — so without
   // this the rows show for a beat and then reflow downward as the lenses pop in.
   // Loading the model and querying the provider up front lets the diff editor
-  // pick them up from cache on first paint.
-  try {
-    await vscode.workspace.openTextDocument(right);
-    await vscode.commands.executeCommand(
-      "vscode.executeCodeLensProvider",
-      right
-    );
-  } catch {
-    /* best effort: the lenses still appear, just slightly later */
+  // pick them up from cache on first paint. A deleted file has no `file:`
+  // document to warm; opening it is what produced "file was not found".
+  if (!missing) {
+    try {
+      await vscode.workspace.openTextDocument(right);
+      await vscode.commands.executeCommand(
+        "vscode.executeCodeLensProvider",
+        right
+      );
+    } catch {
+      /* best effort: the lenses still appear, just slightly later */
+    }
   }
 
   await vscode.commands.executeCommand(
     "vscode.diff",
     left,
     right,
-    diffTitle(absPath, siblings),
+    diffTitle(absPath, siblings, missing === true),
     { preview: true } as vscode.TextDocumentShowOptions
   );
 
@@ -132,14 +187,19 @@ export async function openClaudeDiff(
  * own convention is the basename with the distinguishing word in parentheses,
  * and the directory is only spent when two pending files share a basename.
  */
-export function diffTitle(absPath: string, siblings?: string[]): string {
+export function diffTitle(
+  absPath: string,
+  siblings?: string[],
+  missing = false
+): string {
   const base = path.basename(absPath);
+  const tag = missing ? "Claude · deleted" : "Claude";
   const ambiguous = (siblings ?? []).some(
     (other) => other !== absPath && path.basename(other) === base
   );
   if (!ambiguous) {
-    return `${base} (Claude)`;
+    return `${base} (${tag})`;
   }
   const parent = path.basename(path.dirname(absPath));
-  return `${base} (Claude · ${parent})`;
+  return `${base} (${tag} · ${parent})`;
 }

@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { ChangeStore } from "../changeStore";
+import { ReviewStore } from "../changeStore";
 import { codeLensMode, codeLensStyle } from "../settings";
 import { BASELINE_SCHEME } from "../util";
 import { WHOLE_FILE_LABEL, pluralChanges, summarizeHunk } from "./format";
@@ -22,7 +22,7 @@ export class ClaudeCodeLensProvider
   readonly onDidChangeCodeLenses = this._onDidChange.event;
   private readonly disposables: vscode.Disposable[] = [];
 
-  constructor(private readonly store: ChangeStore) {
+  constructor(private readonly store: ReviewStore) {
     this.disposables.push(
       store.onDidChange(() => this._onDidChange.fire()),
       // In `diffOnly` mode the answer depends on which tabs are open, so the

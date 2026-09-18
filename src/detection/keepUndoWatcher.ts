@@ -50,6 +50,7 @@ const NOTE_TTL_MS = 24 * 3600_000;
  */
 export class KeepUndoWatcher implements vscode.Disposable {
   private watcher: vscode.FileSystemWatcher;
+  private inheritedWatcher: vscode.FileSystemWatcher;
   private timer: NodeJS.Timeout | undefined;
   /** Baseline content paths touched since the last flush. */
   private readonly touched = new Set<string>();
@@ -61,6 +62,10 @@ export class KeepUndoWatcher implements vscode.Disposable {
     stateDir: string,
     private readonly store: ChangeStore
   ) {
+    const parent = path.dirname(stateDir);
+    this.inheritedWatcher = vscode.workspace.createFileSystemWatcher(
+      new vscode.RelativePattern(vscode.Uri.file(parent), "*/baselines/**")
+    );
     this.notesDir = unreviewableDir(stateDir);
     const pattern = new vscode.RelativePattern(
       vscode.Uri.file(stateDir),
@@ -74,6 +79,15 @@ export class KeepUndoWatcher implements vscode.Disposable {
     this.watcher.onDidChange((uri) => this.note(uri));
     this.watcher.onDidDelete(() => {
       // The sidecar that said which file this baseline belonged to is gone too.
+      this.needsFullRefresh = true;
+      this.schedule();
+    });
+    this.inheritedWatcher.onDidCreate((uri) => this.note(uri));
+    this.inheritedWatcher.onDidChange((uri) => this.note(uri));
+    this.inheritedWatcher.onDidDelete((uri) => {
+      if (!this.store.coversInheritedState(uri.fsPath)) {
+        return;
+      }
       this.needsFullRefresh = true;
       this.schedule();
     });
@@ -186,5 +200,6 @@ export class KeepUndoWatcher implements vscode.Disposable {
       clearTimeout(this.timer);
     }
     this.watcher.dispose();
+    this.inheritedWatcher.dispose();
   }
 }

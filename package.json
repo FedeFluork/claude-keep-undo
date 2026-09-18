@@ -2,7 +2,7 @@
   "name": "claude-keep-undo",
   "displayName": "Keep / Undo for Claude Code",
   "description": "Review every change Claude Code makes to your files and Keep or Undo them hunk by hunk, Copilot-style.",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "publisher": "FedeFluork",
   "author": {
     "name": "FedeFluork"
@@ -459,6 +459,24 @@
         "icon": "$(discard)"
       },
       {
+        "command": "claudeKeepUndo.keepFolder",
+        "title": "Keep All Changes in This Folder",
+        "category": "Claude Keep/Undo",
+        "icon": "$(check-all)"
+      },
+      {
+        "command": "claudeKeepUndo.undoFolder",
+        "title": "Undo All Changes in This Folder",
+        "category": "Claude Keep/Undo",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "claudeKeepUndo.openFolderChanges",
+        "title": "Review This Folder's Claude Changes",
+        "category": "Claude Keep/Undo",
+        "icon": "$(diff-multiple)"
+      },
+      {
         "command": "claudeKeepUndo.restoreLastUndo",
         "title": "Restore the Last Undo",
         "category": "Claude Keep/Undo",
@@ -796,6 +814,21 @@
           "command": "claudeKeepUndo.ignorePath",
           "when": "view == claudeKeepUndo.changes && viewItem == claudeUnreviewable",
           "group": "9_ignore@1"
+        },
+        {
+          "command": "claudeKeepUndo.keepFolder",
+          "when": "view == claudeKeepUndo.changes && viewItem == claudeFolder",
+          "group": "inline@1"
+        },
+        {
+          "command": "claudeKeepUndo.undoFolder",
+          "when": "view == claudeKeepUndo.changes && viewItem == claudeFolder",
+          "group": "inline@2"
+        },
+        {
+          "command": "claudeKeepUndo.openFolderChanges",
+          "when": "view == claudeKeepUndo.changes && viewItem == claudeFolder",
+          "group": "navigation@1"
         }
       ],
       "editor/title": [

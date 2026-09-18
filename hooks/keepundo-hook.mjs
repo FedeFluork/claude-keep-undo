@@ -11,11 +11,18 @@
  *   node keepundo-hook.mjs pre  --state "/path/to/state"
  *   node keepundo-hook.mjs post --state "/path/to/state"
  *
- * `--state` is VS Code's per-workspace storage directory. It is deliberately not
+ * `--state` is VS Code's per-folder storage directory. It is deliberately not
  * derived from the payload's `cwd`: that is where `claude` was launched, which
  * differs from the folder VS Code has open whenever it was launched from a
  * subdirectory, and it would put verbatim copies of the user's source inside
  * their repository.
+ *
+ * In a multi-root window the extension also publishes `peers.d/` (one file per
+ * window) and a combined `peers.json` next to that state. A session started in
+ * one folder then photographs every workspace repo those windows want captured,
+ * and routes Edit/Write files into the owning folder. A peer with `bash: false`
+ * is skipped for shell-command snapshots (it is not a Git repository) but still
+ * receives Edit/Write files that belong under it.
  *
  * This script must never block a tool call: it always exits 0 and swallows
  * errors, so a problem here can never interfere with Claude Code.
@@ -71,7 +78,11 @@ function pathKey(absPath) {
   const resolved = path.resolve(absPath);
   const normalized =
     process.platform === "linux" ? resolved : resolved.toLowerCase();
-  return crypto.createHash("sha1").update(normalized).digest("hex").slice(0, 16);
+  return crypto
+    .createHash("sha1")
+    .update(normalized)
+    .digest("hex")
+    .slice(0, 16);
 }
 
 /**
@@ -81,12 +92,142 @@ function pathKey(absPath) {
  */
 function isInside(root, absPath) {
   const fold = (p) =>
-    process.platform === "linux" ? path.resolve(p) : path.resolve(p).toLowerCase();
+    process.platform === "linux"
+      ? path.resolve(p)
+      : path.resolve(p).toLowerCase();
   const rel = path.relative(fold(root), fold(absPath));
   if (rel === "" || path.isAbsolute(rel)) {
     return false;
   }
   return rel !== ".." && !rel.startsWith(`..${path.sep}`);
+}
+
+/** Must match `HOOK_PEERS_TTL_MS` in the extension's util.ts. */
+const HOOK_PEERS_TTL_MS = 30 * 60 * 1000;
+
+/**
+ * Every workspace folder any open window wants photographed. Must match
+ * `readHookPeerRegistrations` in the extension's util.ts.
+ *
+ * Claude Code only loads hooks from the project it was started in, so a Bash
+ * call in repo A would otherwise never photograph sibling repo B. Each window
+ * writes `peers.d/<window>.json`; `peers.json` is the combined list.
+ */
+function loadHookPeers(stateDir, selfRoot) {
+  const fallback = selfRoot ? [{ root: selfRoot, stateDir }] : [];
+  const lists = [];
+  const dir = path.join(stateDir, "peers.d");
+  let sawDir = false;
+  try {
+    const names = fs.readdirSync(dir);
+    sawDir = true;
+    for (const name of names) {
+      if (!name.endsWith(".json") || name.endsWith(".tmp")) {
+        continue;
+      }
+      const filePath = path.join(dir, name);
+      const folders = readPeersFile(filePath, true);
+      if (folders.length > 0) {
+        lists.push(folders);
+      }
+    }
+  } catch {
+    /* missing dir */
+  }
+  if (lists.length > 0) {
+    return unionPeerLists(lists, fallback);
+  }
+  if (sawDir) {
+    return fallback;
+  }
+  const combined = readPeersFile(path.join(stateDir, "peers.json"), false);
+  return combined.length > 0 ? combined : fallback;
+}
+
+function readPeersFile(filePath, requireFresh) {
+  let raw;
+  try {
+    raw = fs.readFileSync(filePath, "utf8");
+  } catch {
+    return [];
+  }
+  if (requireFresh && !isFreshPeerFile(filePath, raw)) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.v !== 1 || !Array.isArray(parsed.folders)) {
+      return [];
+    }
+    const folders = [];
+    for (const item of parsed.folders) {
+      if (
+        item &&
+        typeof item.root === "string" &&
+        typeof item.stateDir === "string"
+      ) {
+        const folder = { root: item.root, stateDir: item.stateDir };
+        if (item.bash === false) {
+          folder.bash = false;
+        }
+        folders.push(folder);
+      }
+    }
+    return folders;
+  } catch {
+    return [];
+  }
+}
+
+function isFreshPeerFile(filePath, raw) {
+  let ts;
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed.ts === "number" && Number.isFinite(parsed.ts)) {
+      ts = parsed.ts;
+    }
+  } catch {
+    ts = undefined;
+  }
+  if (ts === undefined) {
+    try {
+      ts = fs.statSync(filePath).mtimeMs;
+    } catch {
+      return false;
+    }
+  }
+  return Date.now() - ts <= HOOK_PEERS_TTL_MS;
+}
+
+function unionPeerLists(lists, fallback) {
+  const byRoot = new Map();
+  for (const list of lists) {
+    for (const folder of list) {
+      const resolved = path.resolve(folder.root);
+      const key =
+        process.platform === "linux" ? resolved : resolved.toLowerCase();
+      byRoot.set(key, folder);
+    }
+  }
+  const folders = [...byRoot.values()];
+  return folders.length > 0 ? folders : fallback;
+}
+
+/** Deepest published folder that contains `absPath`. */
+function owningPeer(folders, absPath) {
+  let best;
+  let bestLen = -1;
+  for (const folder of folders) {
+    if (!folder.root || !isInside(folder.root, absPath)) {
+      continue;
+    }
+    const n = path.resolve(folder.root).length;
+    if (n > bestLen) {
+      best = folder;
+      bestLen = n;
+    }
+  }
+  return best;
 }
 
 function readStdin() {
@@ -247,7 +388,10 @@ function loadIgnoreRules(stateDir, fallbackRoot) {
   const specs = Array.isArray(descriptor?.sources)
     ? descriptor.sources
     : [
-        { label: "built-in defaults", patterns: module.DEFAULT_IGNORE_PATTERNS },
+        {
+          label: "built-in defaults",
+          patterns: module.DEFAULT_IGNORE_PATTERNS,
+        },
         { label: ".keepundoignore", file: ".keepundoignore" },
       ];
   const sources = [];
@@ -256,7 +400,10 @@ function loadIgnoreRules(stateDir, fallbackRoot) {
       continue;
     }
     if (Array.isArray(spec.patterns)) {
-      sources.push({ label: String(spec.label ?? ""), patterns: spec.patterns });
+      sources.push({
+        label: String(spec.label ?? ""),
+        patterns: spec.patterns,
+      });
       continue;
     }
     if (typeof spec.file !== "string") {
@@ -306,7 +453,8 @@ function git(cwd, args, stdin, raw = false) {
       ? String(res.stderr ?? "")
       : (res.stderr ?? "").toString();
     const missingPath =
-      res.status === 128 && /does not exist in|exists on disk, but not in/.test(stderr);
+      res.status === 128 &&
+      /does not exist in|exists on disk, but not in/.test(stderr);
     if (res.status !== 0) {
       return { ok: false, missingPath };
     }
@@ -428,13 +576,53 @@ function workspacePath(ctx, abs) {
   if (!ctx.root) {
     return abs;
   }
-  if (isInside(ctx.root, abs)) {
-    return abs;
+  const rel = relativeInside(ctx.root, abs);
+  if (rel !== undefined) {
+    return rel === "" ? undefined : path.join(ctx.root, rel);
   }
-  if (ctx.rootReal && isInside(ctx.rootReal, abs)) {
-    return path.join(ctx.root, path.relative(ctx.rootReal, abs));
+  if (ctx.rootReal) {
+    const relReal = relativeInside(ctx.rootReal, abs);
+    if (relReal !== undefined) {
+      return relReal === "" ? undefined : path.join(ctx.root, relReal);
+    }
   }
   return undefined;
+}
+
+/**
+ * Relative path of `abs` under `root`, or undefined when it is not inside.
+ * Prefers `path.relative` so the file-name case is kept; falls back to a
+ * case-folded relative on Windows/macOS when the two spellings disagree.
+ */
+function relativeInside(root, abs) {
+  if (!isInside(root, abs)) {
+    return undefined;
+  }
+  const rel = path.relative(root, abs);
+  if (rel === "") {
+    return "";
+  }
+  if (
+    !path.isAbsolute(rel) &&
+    rel !== ".." &&
+    !rel.startsWith(`..${path.sep}`)
+  ) {
+    return rel;
+  }
+  const fold = (p) =>
+    process.platform === "linux"
+      ? path.resolve(p)
+      : path.resolve(p).toLowerCase();
+  const folded = path.relative(fold(root), fold(abs));
+  if (
+    folded === "" ||
+    path.isAbsolute(folded) ||
+    folded === ".." ||
+    folded.startsWith(`..${path.sep}`)
+  ) {
+    return "";
+  }
+  return folded;
 }
 
 /** Is this path one we are allowed to look at, let alone copy? */
@@ -469,7 +657,7 @@ function writeNote(ctx, abs, reason, remedy) {
 }
 
 const REMEDY_TURN_ON =
-  "Set claudeKeepUndo.detection.bashChanges to \"recover\" to capture these exactly.";
+  'Set claudeKeepUndo.detection.bashChanges to "recover" to capture these exactly.';
 
 /**
  * Before the shell command runs: photograph the repository.
@@ -482,7 +670,7 @@ const REMEDY_TURN_ON =
  * four checkouts measured).
  */
 function bashPre(payload, input, ctx) {
-  if (ctx.bash === "off") {
+  if (ctx.bash === "off" || ctx.skipBash) {
     return;
   }
   if (input.run_in_background === true) {
@@ -560,14 +748,20 @@ function bashPre(payload, input, ctx) {
       continue; // already gone: nothing to read
     }
     if (files >= BASH_MAX_STAGED || bytes >= BASH_MAX_STAGED_BYTES) {
-      slot.skipped.push({ p: rel, why: "too many files had already been changed to capture them all" });
+      slot.skipped.push({
+        p: rel,
+        why: "too many files had already been changed to capture them all",
+      });
       continue;
     }
     let buf;
     try {
       buf = fs.readFileSync(abs);
     } catch {
-      slot.skipped.push({ p: rel, why: "it could not be read before the command ran" });
+      slot.skipped.push({
+        p: rel,
+        why: "it could not be read before the command ran",
+      });
       continue;
     }
     if (buf.length > BASH_MAX_FILE_BYTES) {
@@ -575,7 +769,10 @@ function bashPre(payload, input, ctx) {
       continue;
     }
     if (!isUtf8Text(buf)) {
-      slot.skipped.push({ p: rel, why: "it is not UTF-8 text, so it cannot be reviewed line by line" });
+      slot.skipped.push({
+        p: rel,
+        why: "it is not UTF-8 text, so it cannot be reviewed line by line",
+      });
       continue;
     }
     const pendingFile = path.join(ctx.stateDir, "pending", key);
@@ -598,7 +795,11 @@ function bashPre(payload, input, ctx) {
   }
 
   atomicWrite(
-    path.join(ctx.stateDir, "bash", `${snap.bashSlotId(payload, sha1Hex)}.json`),
+    path.join(
+      ctx.stateDir,
+      "bash",
+      `${snap.bashSlotId(payload, sha1Hex)}.json`
+    ),
     JSON.stringify(slot)
   );
   ctx.note("", undefined, {
@@ -613,7 +814,7 @@ function bashPre(payload, input, ctx) {
  * a byte-exact baseline or a note saying why there is none.
  */
 function bashPost(payload, input, ctx) {
-  if (ctx.bash === "off" || input.run_in_background === true) {
+  if (ctx.bash === "off" || ctx.skipBash || input.run_in_background === true) {
     return;
   }
   const snap = loadBashSnapshot();
@@ -724,7 +925,11 @@ function bashPost(payload, input, ctx) {
         // replacing it in between would otherwise be promoted as this command's
         // original.
         if (sha256(buf) !== staged.sha) {
-          writeNote(ctx, abs, "another tool call replaced the copy taken before this command");
+          writeNote(
+            ctx,
+            abs,
+            "another tool call replaced the copy taken before this command"
+          );
           return;
         }
         let now;
@@ -757,7 +962,12 @@ function bashPost(payload, input, ctx) {
           }
         }
         if (ok) {
-          writeSidecar(baselineFile, abs, sidecar?.created === true, sidecar?.bytes);
+          writeSidecar(
+            baselineFile,
+            abs,
+            sidecar?.created === true,
+            sidecar?.bytes
+          );
         }
         remove(`${pendingFile}.json`);
       };
@@ -777,7 +987,11 @@ function bashPost(payload, input, ctx) {
         // Second, independent confirmation before an Undo is allowed to delete:
         // git must agree the path is absent from the commit.
         if (!slot.head) {
-          writeNote(ctx, abs, "its content before the command could not be established");
+          writeNote(
+            ctx,
+            abs,
+            "its content before the command could not be established"
+          );
           continue;
         }
         const probe = git(slot.top, [
@@ -787,7 +1001,11 @@ function bashPost(payload, input, ctx) {
           `${slot.head}:${bucket.path}`,
         ]);
         if (!probe.missingPath) {
-          writeNote(ctx, abs, "its content before the command could not be established");
+          writeNote(
+            ctx,
+            abs,
+            "its content before the command could not be established"
+          );
           continue;
         }
         if (atomicWrite(baselineFile, "")) {
@@ -802,28 +1020,49 @@ function bashPost(payload, input, ctx) {
         // blob is not what the file held and an Undo would rewrite every line.
         const attr = attrs.get(bucket.path);
         if (attr !== "unspecified") {
-          writeNote(ctx, abs, attr === undefined
-            ? "git did not report whether a filter applies to it, so its previous content cannot be trusted"
-            : "a git filter is configured for it, so its previous content cannot be reproduced exactly");
+          writeNote(
+            ctx,
+            abs,
+            attr === undefined
+              ? "git did not report whether a filter applies to it, so its previous content cannot be trusted"
+              : "a git filter is configured for it, so its previous content cannot be reproduced exactly"
+          );
           continue;
         }
         if (recovered >= BASH_MAX_RECOVER) {
-          writeNote(ctx, abs, "too many files changed for all of them to be recovered");
+          writeNote(
+            ctx,
+            abs,
+            "too many files changed for all of them to be recovered"
+          );
           continue;
         }
         recovered++;
         const got = git(
           slot.top,
-          ["cat-file", "--filters", `--path=${bucket.path}`, `${slot.head}:${bucket.path}`],
+          [
+            "cat-file",
+            "--filters",
+            `--path=${bucket.path}`,
+            `${slot.head}:${bucket.path}`,
+          ],
           undefined,
           true
         );
         if (got.missingPath || !got.ok || !got.buf) {
-          writeNote(ctx, abs, "its content before the command could not be recovered from git");
+          writeNote(
+            ctx,
+            abs,
+            "its content before the command could not be recovered from git"
+          );
           continue;
         }
         if (!isUtf8Text(got.buf)) {
-          writeNote(ctx, abs, "it is not UTF-8 text, so it cannot be reviewed line by line");
+          writeNote(
+            ctx,
+            abs,
+            "it is not UTF-8 text, so it cannot be reviewed line by line"
+          );
           continue;
         }
         if (atomicWrite(baselineFile, got.buf.toString("utf8"))) {
@@ -899,17 +1138,30 @@ async function main() {
   // branch and returns there. Branching on "there is no file_path" instead would
   // turn that smoke test into a git probe on every window open.
   if (payload.tool_name === "Bash") {
-    let rootReal;
-    try {
-      rootReal = root ? fs.realpathSync(root) : undefined;
-    } catch {
-      rootReal = undefined;
-    }
-    const ctx = { stateDir, root, rootReal, cwd, bash: bashMode, ignore, note };
-    if (mode === "pre") {
-      bashPre(payload, input, ctx);
-    } else {
-      bashPost(payload, input, ctx);
+    const peers = loadHookPeers(stateDir, root);
+    const folders = peers.length > 0 ? peers : [{ root, stateDir }];
+    for (const folder of folders) {
+      let rootReal;
+      try {
+        rootReal = folder.root ? fs.realpathSync(folder.root) : undefined;
+      } catch {
+        rootReal = undefined;
+      }
+      const ctx = {
+        stateDir: folder.stateDir,
+        root: folder.root,
+        rootReal,
+        cwd,
+        bash: bashMode,
+        skipBash: folder.bash === false,
+        ignore: loadIgnoreRules(folder.stateDir, folder.root),
+        note,
+      };
+      if (mode === "pre") {
+        bashPre(payload, input, ctx);
+      } else {
+        bashPost(payload, input, ctx);
+      }
     }
     return;
   }
@@ -922,22 +1174,33 @@ async function main() {
     filePath = path.resolve(cwd, filePath);
   }
 
-  // Scope to the folder VS Code has open. The hook sees every file Claude
-  // touches — its own settings, a scratch file, a sibling repository — and
-  // staging those would copy their verbatim content into this workspace's
-  // storage before the extension ever gets a say. `--root` is absent from an
-  // install made before 1.1.0, in which case nothing is filtered here and the
-  // extension drops what it should not have.
-  if (root && !isInside(root, filePath)) {
+  // Scope to a folder VS Code has open. Claude only runs this script from the
+  // project it was started in, so a Write in a sibling repo used to be dropped
+  // here. The published peer list covers every folder any open window wants
+  // photographed; capture into the owning folder's state directory so that
+  // folder's watcher sees it.
+  const peers = loadHookPeers(stateDir, root);
+  const owner = owningPeer(peers, filePath);
+  let captureState = stateDir;
+  let captureIgnore = ignore;
+  if (owner) {
+    captureState = owner.stateDir;
+    if (owner.stateDir !== stateDir) {
+      captureIgnore = loadIgnoreRules(owner.stateDir, owner.root);
+    }
+  } else if (root && !isInside(root, filePath)) {
     return;
   }
 
   const key = pathKey(filePath);
-  const baselineFile = path.join(stateDir, "baselines", key);
-  const pendingFile = path.join(stateDir, "pending", key);
+  const baselineFile = path.join(captureState, "baselines", key);
+  const pendingFile = path.join(captureState, "pending", key);
   const record = (skipped) => note(filePath, skipped);
 
-  if (ignore.status === "ok" && ignore.rules.ignores(ignore.root, filePath)) {
+  if (
+    captureIgnore.status === "ok" &&
+    captureIgnore.rules.ignores(captureIgnore.root, filePath)
+  ) {
     record("ignored");
     return;
   }

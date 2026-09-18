@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { ChangeStore } from "../changeStore";
+import { ReviewStore } from "../changeStore";
 import { statusBarMode } from "../settings";
 import { pluralChanges, pluralFiles } from "./format";
 
@@ -14,7 +14,7 @@ export class ReviewStatusBar implements vscode.Disposable {
   private readonly item: vscode.StatusBarItem;
   private readonly disposables: vscode.Disposable[] = [];
 
-  constructor(private readonly store: ChangeStore) {
+  constructor(private readonly store: ReviewStore) {
     this.item = vscode.window.createStatusBarItem(
       "claudeKeepUndo.pending",
       vscode.StatusBarAlignment.Left,

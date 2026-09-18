@@ -20,6 +20,98 @@ export function normalizePath(absPath: string): string {
   return process.platform === "linux" ? resolved : resolved.toLowerCase();
 }
 
+/**
+ * A Map whose keys are file paths, compared the way {@link normalizePath} does.
+ *
+ * On Windows the hook (git's `D:\...`) and the editor (`uri.fsPath`, often
+ * `d:\...`) routinely disagree on drive-letter case. A plain Map then tracks the
+ * file under one spelling while Keep/Undo look up the other — the queue shows
+ * it, Undo says there is nothing to undo. Folding the key, not the stored
+ * value, is what makes those the same file.
+ */
+export class PathMap<V> {
+  private readonly map = new Map<string, V>();
+
+  get(filePath: string): V | undefined {
+    return this.map.get(normalizePath(filePath));
+  }
+
+  has(filePath: string): boolean {
+    return this.map.has(normalizePath(filePath));
+  }
+
+  set(filePath: string, value: V): this {
+    this.map.set(normalizePath(filePath), value);
+    return this;
+  }
+
+  delete(filePath: string): boolean {
+    return this.map.delete(normalizePath(filePath));
+  }
+
+  clear(): void {
+    this.map.clear();
+  }
+
+  get size(): number {
+    return this.map.size;
+  }
+
+  keys(): IterableIterator<string> {
+    return this.map.keys();
+  }
+
+  values(): IterableIterator<V> {
+    return this.map.values();
+  }
+
+  entries(): IterableIterator<[string, V]> {
+    return this.map.entries();
+  }
+
+  [Symbol.iterator](): IterableIterator<[string, V]> {
+    return this.map.entries();
+  }
+}
+
+/** A Set of file paths, compared the way {@link normalizePath} does. */
+export class PathSet {
+  private readonly set = new Set<string>();
+
+  add(filePath: string): this {
+    this.set.add(normalizePath(filePath));
+    return this;
+  }
+
+  has(filePath: string): boolean {
+    return this.set.has(normalizePath(filePath));
+  }
+
+  delete(filePath: string): boolean {
+    return this.set.delete(normalizePath(filePath));
+  }
+
+  clear(): void {
+    this.set.clear();
+  }
+
+  get size(): number {
+    return this.set.size;
+  }
+
+  values(): IterableIterator<string> {
+    return this.set.values();
+  }
+
+  keys(): IterableIterator<string> {
+    return this.set.keys();
+  }
+
+  [Symbol.iterator](): IterableIterator<string> {
+    return this.set.values();
+  }
+}
+
 /** Short, filesystem-safe id for an absolute file path. */
 export function pathKey(absPath: string): string {
   return crypto
@@ -27,6 +119,620 @@ export function pathKey(absPath: string): string {
     .update(normalizePath(absPath))
     .digest("hex")
     .slice(0, 16);
+}
+
+/**
+ * Is `absPath` a file or subdirectory of `root` — not the root itself, and not
+ * something that merely shares a prefix (`/app` vs `/apple`)?
+ *
+ * Same rule `ChangeStore.isInScope` has always used; extracted so multi-root
+ * routing and the store can share one answer.
+ */
+export function isInsideRoot(root: string, absPath: string): boolean {
+  const rel = path.relative(normalizePath(root), normalizePath(absPath));
+  if (rel === "" || path.isAbsolute(rel)) {
+    return false;
+  }
+  return rel !== ".." && !rel.startsWith(`..${path.sep}`);
+}
+
+/**
+ * The workspace folder that owns this file: the deepest root that contains it.
+ *
+ * Nested folders (a repo opened inside another) must not double-track: the
+ * inner root wins. A path under no root yields `undefined`.
+ */
+export function owningRoot(
+  roots: readonly string[],
+  absPath: string
+): string | undefined {
+  let best: string | undefined;
+  let bestLen = -1;
+  for (const root of roots) {
+    if (!isInsideRoot(root, absPath)) {
+      continue;
+    }
+    const n = normalizePath(root).length;
+    if (n > bestLen) {
+      best = root;
+      bestLen = n;
+    }
+  }
+  return best;
+}
+
+/**
+ * Should this folder's store review `absPath`?
+ *
+ * A file under a *peer* workspace folder belongs to that folder, even when
+ * `trackOutside` is on — "outside the workspace" is not "the other repo in this
+ * window". Nested peers take the inner root. Files under no folder follow
+ * `trackOutside`.
+ */
+export function pathIsInFolderScope(
+  absPath: string,
+  folderRoot: string,
+  peerRoots: readonly string[],
+  trackOutside: boolean
+): boolean {
+  const owner = owningRoot([folderRoot, ...peerRoots], absPath);
+  if (owner !== undefined) {
+    return normalizePath(owner) === normalizePath(folderRoot);
+  }
+  return trackOutside;
+}
+
+/** Combined peer list the hook reads. Union of every window's registration. */
+export const HOOK_PEERS_FILE = "peers.json";
+
+/** Per-window peer registrations. Last-writer must not replace another window. */
+export const HOOK_PEERS_DIR = "peers.d";
+
+/** Rewrite this window's registration this often so a live window does not expire. */
+export const HOOK_PEERS_HEARTBEAT_MS = 5 * 60_000;
+
+/** Drop a window file that has not been rewritten within this interval. */
+export const HOOK_PEERS_TTL_MS = 30 * 60_000;
+
+/** Records which workspace folder a state directory belongs to. */
+export const FOLDER_IDENTITY_FILE = "folder.json";
+
+export interface HookPeerFolder {
+  root: string;
+  stateDir: string;
+  /**
+   * When `false`, the Bash hook must not photograph this folder. A sibling that
+   * is not a Git repository still owns Edit/Write files, but `git status` there
+   * cannot say what a shell command changed. Omitted means try — the hook's
+   * own `rev-parse` is the fallback for an older peers file.
+   */
+  bash?: boolean;
+}
+
+export function serializeHookPeers(folders: readonly HookPeerFolder[]): string {
+  return JSON.stringify({ v: 1 as const, folders });
+}
+
+export function serializeHookPeerRegistration(
+  folders: readonly HookPeerFolder[],
+  ts = Date.now()
+): string {
+  return JSON.stringify({ v: 1 as const, ts, folders });
+}
+
+/**
+ * Folders this hook should photograph. Missing or malformed files fall back to
+ * the session folder — a window that has never published peers, or an install
+ * from before they existed.
+ */
+export function parseHookPeers(
+  raw: string | undefined,
+  fallback: HookPeerFolder
+): HookPeerFolder[] {
+  return parseHookPeersList(raw) ?? [fallback];
+}
+
+/** Well-formed folder list, or `undefined` when the payload cannot be used. */
+export function parseHookPeersList(
+  raw: string | undefined
+): HookPeerFolder[] | undefined {
+  if (!raw) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(raw) as { v?: unknown; folders?: unknown };
+    if (parsed.v !== 1 || !Array.isArray(parsed.folders)) {
+      return undefined;
+    }
+    const folders: HookPeerFolder[] = [];
+    for (const item of parsed.folders) {
+      if (!item || typeof item !== "object") {
+        continue;
+      }
+      const rec = item as {
+        root?: unknown;
+        stateDir?: unknown;
+        bash?: unknown;
+      };
+      if (typeof rec.root === "string" && typeof rec.stateDir === "string") {
+        const folder: HookPeerFolder = {
+          root: rec.root,
+          stateDir: rec.stateDir,
+        };
+        if (rec.bash === false) {
+          folder.bash = false;
+        }
+        folders.push(folder);
+      }
+    }
+    return folders.length > 0 ? folders : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** One folder per root, last occurrence wins. Empty input yields `fallback`. */
+export function unionHookPeers(
+  lists: readonly HookPeerFolder[][],
+  fallback: HookPeerFolder
+): HookPeerFolder[] {
+  const byRoot = new Map<string, HookPeerFolder>();
+  for (const list of lists) {
+    for (const folder of list) {
+      byRoot.set(normalizePath(folder.root), folder);
+    }
+  }
+  const folders = [...byRoot.values()];
+  return folders.length > 0 ? folders : [fallback];
+}
+
+export function hookPeersWindowFile(
+  stateDir: string,
+  windowId: string
+): string {
+  return path.join(stateDir, HOOK_PEERS_DIR, `${pathKey(windowId)}.json`);
+}
+
+/**
+ * Folders any currently registered window wants photographed. Per-window files
+ * are the source of truth. `peers.json` is the combined list written for the
+ * hook — used only when no `peers.d` directory exists yet (an older install).
+ * An empty `peers.d` means no window is registered, not "reuse the last union".
+ */
+export function readHookPeerRegistrations(
+  stateDir: string,
+  fallback: HookPeerFolder
+): HookPeerFolder[] {
+  const lists = listHookPeerRegistrationLists(stateDir);
+  if (lists.length > 0) {
+    return unionHookPeers(lists, fallback);
+  }
+  if (fileExists(path.join(stateDir, HOOK_PEERS_DIR))) {
+    return [fallback];
+  }
+  return (
+    parseHookPeersList(readFileSafe(path.join(stateDir, HOOK_PEERS_FILE))) ?? [
+      fallback,
+    ]
+  );
+}
+
+/**
+ * Live per-window folder lists. Expired files are deleted so they cannot keep
+ * a crashed window's capture scope alive.
+ */
+export function listHookPeerRegistrationLists(
+  stateDir: string
+): HookPeerFolder[][] {
+  const lists: HookPeerFolder[][] = [];
+  const dir = path.join(stateDir, HOOK_PEERS_DIR);
+  for (const name of listDir(dir)) {
+    if (!name.endsWith(".json") || name.endsWith(".tmp")) {
+      continue;
+    }
+    const filePath = path.join(dir, name);
+    const raw = readFileSafe(filePath);
+    if (!isFreshHookPeerRegistration(raw, filePath)) {
+      removeFile(filePath);
+      continue;
+    }
+    const parsed = parseHookPeersList(raw);
+    if (parsed) {
+      lists.push(parsed);
+    }
+  }
+  return lists;
+}
+
+export function isFreshHookPeerRegistration(
+  raw: string | undefined,
+  filePath: string,
+  now = Date.now()
+): boolean {
+  const ts = hookPeerRegistrationTime(raw, filePath);
+  if (ts === undefined) {
+    return false;
+  }
+  return now - ts <= HOOK_PEERS_TTL_MS;
+}
+
+function hookPeerRegistrationTime(
+  raw: string | undefined,
+  filePath: string
+): number | undefined {
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw) as { ts?: unknown };
+      if (typeof parsed.ts === "number" && Number.isFinite(parsed.ts)) {
+        return parsed.ts;
+      }
+    } catch {
+      /* fall through to mtime */
+    }
+  }
+  try {
+    return fs.statSync(filePath).mtimeMs;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * True when some registered window still has `selfRoot` open without `destRoot`
+ * (or, if `destRoot` is omitted, still has `selfRoot` at all). Opening a nested
+ * layout in this window must not move files another window still treats as
+ * belonging here.
+ */
+export function otherWindowHoldsFolder(
+  sourceStateDir: string,
+  selfRoot: string,
+  destRoot?: string
+): boolean {
+  const self = normalizePath(selfRoot);
+  const dest = destRoot === undefined ? undefined : normalizePath(destRoot);
+  for (const list of listHookPeerRegistrationLists(sourceStateDir)) {
+    const roots = new Set(list.map((folder) => normalizePath(folder.root)));
+    if (!roots.has(self)) {
+      continue;
+    }
+    if (dest === undefined || !roots.has(dest)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function writeFolderIdentity(stateDir: string, root: string): void {
+  atomicWrite(
+    path.join(stateDir, FOLDER_IDENTITY_FILE),
+    JSON.stringify({ v: 1 as const, root })
+  );
+}
+
+export function readFolderIdentity(stateDir: string): string | undefined {
+  const raw = readFileSafe(path.join(stateDir, FOLDER_IDENTITY_FILE));
+  if (!raw) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(raw) as { v?: unknown; root?: unknown };
+    if (parsed.v === 1 && typeof parsed.root === "string" && parsed.root) {
+      return parsed.root;
+    }
+  } catch {
+    /* ignore */
+  }
+  return undefined;
+}
+
+/**
+ * State directories of folders nested inside `selfRoot`. An outer-only window
+ * uses these to list reviews another window relocated into an inner store.
+ */
+export function descendantFolderStores(
+  selfStateDir: string,
+  selfRoot: string
+): HookPeerFolder[] {
+  return relatedFolderStores(selfStateDir, selfRoot).filter((folder) =>
+    isInsideRoot(selfRoot, folder.root)
+  );
+}
+
+/**
+ * Nested folders inside this one, and parent folders this one sits inside.
+ * Sibling repos share the `folders/` directory but are not related.
+ */
+export function relatedFolderStores(
+  selfStateDir: string,
+  selfRoot: string
+): HookPeerFolder[] {
+  const parent = path.dirname(selfStateDir);
+  const selfDir = normalizePath(selfStateDir);
+  const found: HookPeerFolder[] = [];
+  for (const name of listDir(parent)) {
+    const dir = path.join(parent, name);
+    if (normalizePath(dir) === selfDir) {
+      continue;
+    }
+    const root = readFolderIdentity(dir);
+    if (!root) {
+      continue;
+    }
+    if (isInsideRoot(selfRoot, root) || isInsideRoot(root, selfRoot)) {
+      found.push({ root, stateDir: dir });
+    }
+  }
+  return found;
+}
+
+/**
+ * Path of this folder's own baseline or staging for `absPath`, whether or not it exists yet.
+ */
+export function ownStatePair(
+  absPath: string,
+  stateDir: string,
+  kind: "baselines" | "pending"
+): string {
+  const dirOf = kind === "baselines" ? baselinesDir : pendingDir;
+  return path.join(dirOf(stateDir), pathKey(absPath));
+}
+
+/**
+ * Every related store that already has a baseline or staging for `absPath`.
+ *
+ * Used when an explicit Keep or Undo must update or remove the copy the user
+ * is looking at — including one that lives in a parent or nested store —
+ * without leaving a duplicate behind for the next refresh to rediscover.
+ */
+export function existingStatePairs(
+  absPath: string,
+  stores: readonly HookPeerFolder[],
+  kind: "baselines" | "pending"
+): string[] {
+  const seen = new Set<string>();
+  const found: string[] = [];
+  for (const folder of stores) {
+    const content = ownStatePair(absPath, folder.stateDir, kind);
+    const key = normalizePath(content);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    if (fileExists(content)) {
+      found.push(content);
+    }
+  }
+  return found;
+}
+
+/** Delete every related baseline or staging for `absPath`, with its sidecar. */
+export function removeStatePairs(
+  absPath: string,
+  stores: readonly HookPeerFolder[],
+  kind: "baselines" | "pending"
+): number {
+  let n = 0;
+  for (const content of existingStatePairs(absPath, stores, kind)) {
+    removeFile(content);
+    removeFile(sidecarPath(content));
+    n++;
+  }
+  return n;
+}
+
+/**
+ * Path of the baseline or staging this window should *read* for `absPath`.
+ *
+ * This window's own store wins if it already has a copy. If this store has
+ * none, fall back to a related store that does — parent or nested — so each
+ * window can list a review the other captured. New captures still land in
+ * `preferredStateDir`.
+ *
+ * Passive browsing must not move or delete the fallback copy. An explicit
+ * Keep or Undo applies to that copy (see {@link existingStatePairs}).
+ */
+export function locateStatePair(
+  absPath: string,
+  stores: readonly HookPeerFolder[],
+  kind: "baselines" | "pending",
+  preferredStateDir: string
+): string {
+  const preferred = ownStatePair(absPath, preferredStateDir, kind);
+  if (fileExists(preferred)) {
+    return preferred;
+  }
+  const existing = stores.filter((folder) =>
+    fileExists(ownStatePair(absPath, folder.stateDir, kind))
+  );
+  if (existing.length === 0) {
+    return preferred;
+  }
+  const winner = owningPeer(existing, absPath) ?? existing[0];
+  return ownStatePair(absPath, winner.stateDir, kind);
+}
+
+/** The peer folder that owns this path, or undefined when none contains it. */
+export function owningPeer(
+  folders: readonly HookPeerFolder[],
+  absPath: string
+): HookPeerFolder | undefined {
+  const root = owningRoot(
+    folders.map((f) => f.root),
+    absPath
+  );
+  if (root === undefined) {
+    return undefined;
+  }
+  const key = normalizePath(root);
+  return folders.find((f) => normalizePath(f.root) === key);
+}
+
+/**
+ * Move one file, falling back to copy+delete across filesystems.
+ *
+ * Same idea as {@link moveDir}, for a baseline or sidecar that is changing
+ * which folder's state directory it lives in.
+ */
+export function moveFile(from: string, to: string): boolean {
+  try {
+    ensureDir(path.dirname(to));
+    fs.renameSync(from, to);
+    return true;
+  } catch {
+    try {
+      ensureDir(path.dirname(to));
+      fs.copyFileSync(from, to);
+      fs.rmSync(from, { force: true });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+export type RelocateResult =
+  "moved" | "kept-destination" | "missing" | "failed";
+
+/**
+ * Move a baseline/pending content+sidecar pair into another folder's matching
+ * directory. If that directory already has this `pathKey`, keep the destination
+ * copy and drop the source — two queues must not hold the same file.
+ */
+export function relocateStatePair(
+  contentPath: string,
+  destDir: string
+): RelocateResult {
+  if (!fileExists(contentPath)) {
+    return "missing";
+  }
+  ensureDir(destDir);
+  const dest = path.join(destDir, path.basename(contentPath));
+  if (normalizePath(contentPath) === normalizePath(dest)) {
+    return "moved";
+  }
+  const srcSidecar = sidecarPath(contentPath);
+  const destSidecar = sidecarPath(dest);
+  if (fileExists(dest)) {
+    removeFile(contentPath);
+    removeFile(srcSidecar);
+    return "kept-destination";
+  }
+  if (!moveFile(contentPath, dest)) {
+    return "failed";
+  }
+  if (fileExists(srcSidecar) && !moveFile(srcSidecar, destSidecar)) {
+    moveFile(dest, contentPath);
+    return "failed";
+  }
+  return "moved";
+}
+
+/**
+ * Move baselines or stagings whose owner (among `owners`) is not this folder
+ * into that owner's state directory.
+ *
+ * `owners` must include this folder when it is still in the window: otherwise a
+ * nested inner store would treat the outer peer as the owner and bounce the
+ * file back. When this folder is *leaving*, pass only the folders that remain.
+ *
+ * When *leaving*, a file is left in place if another window still has this
+ * folder open. When still open, a file is left in place if another window
+ * has this folder without the destination — merely opening a nested layout
+ * must not hide (or steal) another window's originals.
+ */
+export function rehomeDisplacedPairs(
+  sourceStateDir: string,
+  selfRoot: string,
+  owners: readonly HookPeerFolder[],
+  kind: "baselines" | "pending",
+  log?: (msg: string) => void,
+  leaving = false
+): number {
+  if (owners.length === 0) {
+    return 0;
+  }
+  const sourceDir =
+    kind === "baselines"
+      ? baselinesDir(sourceStateDir)
+      : pendingDir(sourceStateDir);
+  const self = normalizePath(selfRoot);
+  let n = 0;
+  for (const name of listDir(sourceDir)) {
+    if (name.endsWith(".json") || name.endsWith(".tmp")) {
+      continue;
+    }
+    const contentPath = path.join(sourceDir, name);
+    const sidecar = readSidecar(contentPath);
+    if (!sidecar) {
+      continue;
+    }
+    const owner = owningPeer(owners, sidecar.path);
+    if (!owner || normalizePath(owner.root) === self) {
+      continue;
+    }
+    if (
+      otherWindowHoldsFolder(
+        sourceStateDir,
+        selfRoot,
+        leaving ? undefined : owner.root
+      )
+    ) {
+      log?.(
+        `left ${kind} for ${sidecar.path} in place: another window still uses this folder`
+      );
+      continue;
+    }
+    const destDir =
+      kind === "baselines"
+        ? baselinesDir(owner.stateDir)
+        : pendingDir(owner.stateDir);
+    const result = relocateStatePair(contentPath, destDir);
+    if (result === "moved" || result === "kept-destination") {
+      n++;
+      log?.(
+        result === "moved"
+          ? `moved ${kind} for ${sidecar.path} into ${owner.root}`
+          : `dropped duplicate ${kind} for ${sidecar.path}; ${owner.root} already has it`
+      );
+    } else if (result === "failed") {
+      log?.(`could not move ${kind} for ${sidecar.path} into ${owner.root}`);
+    }
+  }
+  return n;
+}
+
+/** Per-folder review state, keyed by the folder path so it follows the repo. */
+export function folderStateDir(
+  globalStorageFsPath: string,
+  folderRoot: string
+): string {
+  return path.join(globalStorageFsPath, "folders", pathKey(folderRoot));
+}
+
+/**
+ * Where 1.2.x fell back when `storageUri` was missing: still keyed by folder,
+ * but under `workspaces/` rather than `folders/`.
+ */
+export function legacyWorkspaceFallbackStateDir(
+  globalStorageFsPath: string,
+  folderRoot: string
+): string {
+  return path.join(globalStorageFsPath, "workspaces", pathKey(folderRoot));
+}
+
+/** True when a state directory already holds baselines or staged copies. */
+export function stateDirHasContent(dir: string): boolean {
+  if (!fileExists(dir)) {
+    return false;
+  }
+  return (
+    listDir(baselinesDir(dir)).some(
+      (name) => !name.endsWith(".json") && !name.endsWith(".tmp")
+    ) ||
+    listDir(pendingDir(dir)).some(
+      (name) => !name.endsWith(".json") && !name.endsWith(".tmp")
+    )
+  );
 }
 
 /**
@@ -75,7 +781,8 @@ export function claudeFileHistoryDir(): string {
 
 // --- shared on-disk layout ------------------------------------------------
 //
-// <stateDir>/                       (VS Code's per-workspace storage, NOT the repo)
+// <stateDir>/                       (per *folder*, under VS Code globalStorage,
+//                                   NOT the repo and not the VS Code workspace)
 //   baselines/<key>                 original (pre-Claude) content
 //   baselines/<key>.json            { path, ts } sidecar — makes each baseline
 //                                   self-describing so no shared index file has
@@ -83,11 +790,22 @@ export function claudeFileHistoryDir(): string {
 //   pending/<key>                   content staged between the Pre and Post hook
 //   pending/<key>.json              { path, ts } sidecar — `ts` expires stagings
 //   snapshots/<key>-<ts>            pre-Undo safety copies
+//   ignore.json                     ignore rules published for the hook process
+//   folder.json                     which workspace folder this state dir is for
+//   peers.d/<window>.json           this window's folders, so another window
+//                                   cannot overwrite the combined peer list
+//   peers.json                      union of every live window's registration, for
+//                                   the hook running in one repo to capture
+//                                   the others. A folder with bash:false is
+//                                   still an Edit/Write owner, but is not
+//                                   photographed on a shell command.
 //   events.ndjson                   append-only hook event log (size-capped)
 //
-// The state deliberately lives outside the workspace: baselines and snapshots
-// are verbatim copies of the user's source, and keeping them in the repository
-// is one `git add -A` away from committing whatever secrets those files held.
+// Keyed by the folder path so the same repo keeps its review queue when opened
+// alone, in another multi-root window, or after a reload. Deliberately outside
+// the repository: baselines and snapshots are verbatim copies of the user's
+// source, and keeping them there is one `git add -A` away from committing
+// whatever secrets those files held.
 
 export function baselinesDir(stateDir: string): string {
   return path.join(stateDir, "baselines");
@@ -107,6 +825,14 @@ export function snapshotsDir(stateDir: string): string {
  * the store must not depend on the UI.
  */
 export const BASELINE_SCHEME = "claude-baseline";
+
+/**
+ * Right-hand side of a Claude diff when the file no longer exists. `file:`
+ * cannot be opened — VS Code reports "The editor could not be opened because
+ * the file was not found" — so a deleted file is shown against this empty
+ * document instead. `uri.fsPath` is still the real path.
+ */
+export const CURRENT_SCHEME = "claude-current";
 
 /** Where releases before 0.2.0 kept their state, inside the repository. */
 export function legacyStateDir(workspaceRoot: string): string {

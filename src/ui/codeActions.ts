@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { ChangeStore } from "../changeStore";
+import { ReviewStore } from "../changeStore";
 import { hunkLineRange } from "../diff";
 import { quickFixMode } from "../settings";
 import { pluralChanges, summarizeHunk } from "./format";
@@ -19,7 +19,7 @@ export class ClaudeCodeActionProvider implements vscode.CodeActionProvider {
     providedCodeActionKinds: [vscode.CodeActionKind.QuickFix],
   };
 
-  constructor(private readonly store: ChangeStore) {}
+  constructor(private readonly store: ReviewStore) {}
 
   provideCodeActions(
     document: vscode.TextDocument,
