@@ -180,6 +180,7 @@ describe("manifest: in-file review menus", () => {
       "claudeKeepUndo.undoAtLine",
       "claudeKeepUndo.keepHunk",
       "claudeKeepUndo.undoHunk",
+      "claudeKeepUndo.gotoHunk",
     ]) {
       assert.ok(hidden.has(command), `${command} should be palette-hidden`);
     }

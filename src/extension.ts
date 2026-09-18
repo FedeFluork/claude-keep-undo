@@ -29,7 +29,7 @@ import { DiffLayoutController } from "./ui/diffLayout";
 import { Feedback, shortName } from "./ui/feedback";
 import { ClaudeFileDecorationProvider } from "./ui/fileDecorations";
 import { pluralChanges, pluralFiles } from "./ui/format";
-import { goToChange } from "./ui/navigation";
+import { goToChange, goToHunk } from "./ui/navigation";
 import { ClaudeSourceControl, DoubledGutterNotice } from "./ui/quickDiff";
 import { PanelStatus, SettingsPanel } from "./ui/settingsPanel";
 import { ReviewStatusBar } from "./ui/statusBar";
@@ -318,6 +318,15 @@ export function activate(
     ),
     vscode.commands.registerCommand("claudeKeepUndo.previousChange", () =>
       goToChange(store, -1)
+    ),
+    vscode.commands.registerCommand(
+      "claudeKeepUndo.gotoHunk",
+      (absPath?: unknown, index?: unknown) => {
+        if (typeof absPath !== "string" || typeof index !== "number") {
+          return;
+        }
+        goToHunk(store, absPath, index);
+      }
     ),
     vscode.commands.registerCommand(
       "claudeKeepUndo.keepFile",

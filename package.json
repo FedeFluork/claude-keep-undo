@@ -430,6 +430,11 @@
         "icon": "$(arrow-up)"
       },
       {
+        "command": "claudeKeepUndo.gotoHunk",
+        "title": "Go to This Claude Change",
+        "category": "Claude Keep/Undo"
+      },
+      {
         "command": "claudeKeepUndo.keepFile",
         "title": "Keep All Changes in This File",
         "category": "Claude Keep/Undo",
@@ -627,6 +632,10 @@
         },
         {
           "command": "claudeKeepUndo.undoAtLine",
+          "when": "false"
+        },
+        {
+          "command": "claudeKeepUndo.gotoHunk",
           "when": "false"
         }
       ],

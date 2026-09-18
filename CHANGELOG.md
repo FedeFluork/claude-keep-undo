@@ -5,6 +5,15 @@ All notable changes to **Keep / Undo for Claude Code** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added — hunk navigation CodeLens
+
+- **When a file has several hunks**, the hunk under the caret also shows
+  `⬆️ prev` / `n of N` / `⬇️ next` on the same CodeLens row as Keep / Undo.
+  Prev and next wrap. The file-level `Claude: N changes` plus Keep all /
+  Undo all at the top of the file is unchanged.
+
 ## [1.2.0]
 
 ### Added — files Claude changes by running a shell command

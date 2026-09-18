@@ -43,7 +43,49 @@ export async function goToChange(
   );
   const line = editor.selection.active.line;
   const index = pick(hunks, line, direction);
-  const hunk = hunks[index];
+  revealHunk(editor, hunks[index], index, hunks.length);
+}
+
+/**
+ * Jump to a specific hunk in a tracked file, staying in whichever editor is
+ * already showing it (the ordinary tab or the modified side of a Claude diff).
+ */
+export function goToHunk(
+  store: ChangeStore,
+  absPath: string,
+  index: number
+): void {
+  const tracked = store.get(absPath);
+  if (!tracked || index < 0 || index >= tracked.hunks.length) {
+    return;
+  }
+  const editor = editorForPath(absPath);
+  if (!editor) {
+    return;
+  }
+  revealHunk(editor, tracked.hunks[index], index, tracked.hunks.length);
+}
+
+function editorForPath(absPath: string): vscode.TextEditor | undefined {
+  const active = vscode.window.activeTextEditor;
+  if (
+    active &&
+    active.document.uri.scheme === "file" &&
+    active.document.uri.fsPath === absPath
+  ) {
+    return active;
+  }
+  return vscode.window.visibleTextEditors.find(
+    (e) => e.document.uri.scheme === "file" && e.document.uri.fsPath === absPath
+  );
+}
+
+function revealHunk(
+  editor: vscode.TextEditor,
+  hunk: Hunk,
+  index: number,
+  total: number
+): void {
   const { start, end } = hunkLineRange(hunk);
   const lastLine = Math.max(0, editor.document.lineCount - 1);
   const from = new vscode.Position(Math.min(start, lastLine), 0);
@@ -55,7 +97,7 @@ export async function goToChange(
     vscode.TextEditorRevealType.InCenterIfOutsideViewport
   );
   vscode.window.setStatusBarMessage(
-    `Claude change ${index + 1} of ${hunks.length} · ${summarizeHunk(hunk)}`,
+    `Claude change ${index + 1} of ${total} · ${summarizeHunk(hunk)}`,
     4000
   );
 }

@@ -43,6 +43,10 @@ describe("Keep / Undo for Claude Code", () => {
     return content;
   }
 
+  function lensLabel(title: string): string {
+    return title.replace(/[\u00a0\u2800]/g, " ").trim();
+  }
+
   async function ourCodeLenses(file: string): Promise<vscode.CodeLens[]> {
     const uri = vscode.Uri.file(file);
     // The provider command needs a resolvable text model, so make sure the
@@ -53,9 +57,15 @@ describe("Keep / Undo for Claude Code", () => {
         "vscode.executeCodeLensProvider",
         uri
       )) ?? [];
-    return lenses.filter((l) =>
-      l.command?.command.startsWith("claudeKeepUndo.")
-    );
+    return lenses.filter((l) => {
+      const id = l.command?.command ?? "";
+      if (id.startsWith("claudeKeepUndo.")) {
+        return true;
+      }
+      // The "n of N" label is ours but has an empty command so it is not a link.
+      const title = lensLabel(l.command?.title ?? "");
+      return id === "" && /^\d+ of \d+$/.test(title);
+    });
   }
 
   /** Set one of our settings for the duration of the test host. */
@@ -144,6 +154,7 @@ describe("Keep / Undo for Claude Code", () => {
       "claudeKeepUndo.undoAtCursor",
       "claudeKeepUndo.nextChange",
       "claudeKeepUndo.previousChange",
+      "claudeKeepUndo.gotoHunk",
       "claudeKeepUndo.restoreLastUndo",
       "claudeKeepUndo.installHooks",
       "claudeKeepUndo.openSettings",
@@ -542,6 +553,54 @@ describe("Keep / Undo for Claude Code", () => {
 
     await vscode.commands.executeCommand("claudeKeepUndo.previousChange");
     assert.equal(editor.selection.active.line, 4);
+  });
+
+  it("adds prev/next and n of N CodeLenses on the current hunk", async () => {
+    const file = makeFile("it-lens-nav.txt", "a\nB\nc\nd\nE\nf\n");
+    seedBaseline(file, "a\nb\nc\nd\ne\nf\n");
+    await vscode.commands.executeCommand("claudeKeepUndo.refresh");
+
+    const editor = await vscode.window.showTextDocument(vscode.Uri.file(file));
+    editor.selection = new vscode.Selection(1, 0, 1, 0);
+
+    const titles = (lenses: vscode.CodeLens[]): string[] =>
+      lenses.map((l) => lensLabel(l.command?.title ?? ""));
+
+    let lenses = await ourCodeLenses(file);
+    assert.ok(titles(lenses).some((t) => t.endsWith("prev")));
+    assert.ok(titles(lenses).includes("1 of 2"));
+    assert.ok(titles(lenses).some((t) => t.endsWith("next")));
+    assert.ok(
+      titles(lenses).some((t) => t.endsWith(" all")),
+      "file-level Keep all / Undo all should still be present"
+    );
+
+    const next = lenses.find((l) =>
+      lensLabel(l.command?.title ?? "").endsWith("next")
+    );
+    assert.ok(next?.command, "expected a next lens on hunk 1");
+    await vscode.commands.executeCommand(
+      next.command.command,
+      ...(next.command.arguments ?? [])
+    );
+    assert.equal(editor.selection.active.line, 4, "next should land on hunk 2");
+
+    lenses = await ourCodeLenses(file);
+    assert.ok(titles(lenses).includes("2 of 2"));
+    assert.ok(
+      !titles(lenses).includes("1 of 2"),
+      "the extras should follow the caret to the current hunk"
+    );
+
+    const prev = lenses.find((l) =>
+      lensLabel(l.command?.title ?? "").endsWith("prev")
+    );
+    assert.ok(prev?.command, "expected a prev lens on hunk 2");
+    await vscode.commands.executeCommand(
+      prev.command.command,
+      ...(prev.command.arguments ?? [])
+    );
+    assert.equal(editor.selection.active.line, 1, "prev should wrap to hunk 1");
   });
 
   it("puts an undone file back under review, content and baseline together", async () => {

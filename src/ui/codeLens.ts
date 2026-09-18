@@ -3,10 +3,12 @@ import { ChangeStore } from "../changeStore";
 import { codeLensMode, codeLensStyle } from "../settings";
 import { BASELINE_SCHEME } from "../util";
 import { WHOLE_FILE_LABEL, pluralChanges, summarizeHunk } from "./format";
+import { currentHunkIndex, neighborHunkIndex } from "./hunkNav";
 
 /**
  * Per-hunk "Keep | Undo" actions rendered inline above each change (plus a file
- * summary with Keep all / Undo all).
+ * summary with Keep all / Undo all). When a file has several hunks, the hunk
+ * under the caret also gets ⬆️ prev / n of N / ⬇️ next on the same inserted row.
  *
  * Every row displaces a line of code, so where they appear is a setting
  * (`claudeKeepUndo.codeLens`) and the default is `diffOnly`: in the ordinary
@@ -27,6 +29,14 @@ export class ClaudeCodeLensProvider
       // lenses have to be recomputed when that changes — otherwise opening the
       // diff of a file that is already visible would show none.
       vscode.window.tabGroups.onDidChangeTabs(() => this._onDidChange.fire()),
+      vscode.window.onDidChangeActiveTextEditor(() => this._onDidChange.fire()),
+      vscode.window.onDidChangeTextEditorSelection((e) => {
+        const key = this.navKey(e.textEditor);
+        if (key !== this.lastNavKey) {
+          this.lastNavKey = key;
+          this._onDidChange.fire();
+        }
+      }),
       vscode.workspace.onDidChangeConfiguration((e) => {
         if (
           e.affectsConfiguration("claudeKeepUndo.codeLens") ||
@@ -36,6 +46,21 @@ export class ClaudeCodeLensProvider
         }
       })
     );
+  }
+
+  private lastNavKey = "";
+
+  /** Cheap identity for "did the current-hunk extras move?" */
+  private navKey(editor: vscode.TextEditor): string {
+    if (editor.document.uri.scheme !== "file") {
+      return "";
+    }
+    const absPath = editor.document.uri.fsPath;
+    const tracked = this.store.get(absPath);
+    if (!tracked || tracked.hunks.length < 2) {
+      return absPath;
+    }
+    return `${absPath}:${currentHunkIndex(tracked.hunks, editor.selection.active.line)}`;
   }
 
   provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
@@ -58,6 +83,10 @@ export class ClaudeCodeLensProvider
     const lenses: vscode.CodeLens[] = [];
     const keep = codeLensStyle() === "emoji" ? "✅ Keep" : "Keep";
     const undo = codeLensStyle() === "emoji" ? "❌ Undo" : "Undo";
+    const prev = codeLensStyle() === "emoji" ? "⬆️ prev" : "↑ prev";
+    const next = codeLensStyle() === "emoji" ? "⬇️ next" : "↓ next";
+    const currentIndex =
+      tracked.hunks.length > 1 ? this.currentHunkFor(document) : undefined;
 
     // The file summary is only worth a row when there is more than one hunk:
     // with a single hunk "Keep all" is the same action as "Keep", and if that
@@ -69,17 +98,17 @@ export class ClaudeCodeLensProvider
         : `Claude: ${pluralChanges(tracked.hunks.length)}`;
       lenses.push(
         new vscode.CodeLens(summaryRange, {
-          title: label,
+          title: lensTitle(label, "first"),
           command: "claudeKeepUndo.openDiff",
           arguments: [absPath],
         }),
         new vscode.CodeLens(summaryRange, {
-          title: `${keep} all`,
+          title: lensTitle(`${keep} all`),
           command: "claudeKeepUndo.keepFile",
           arguments: [absPath],
         }),
         new vscode.CodeLens(summaryRange, {
-          title: `${undo} all`,
+          title: lensTitle(`${undo} all`),
           command: "claudeKeepUndo.undoFile",
           arguments: [absPath],
         })
@@ -91,23 +120,65 @@ export class ClaudeCodeLensProvider
       const range = new vscode.Range(line, 0, line, 0);
       lenses.push(
         new vscode.CodeLens(range, {
-          title: `${keep} (${summarizeHunk(hunk)}${
-            hunk.degraded ? `, ${WHOLE_FILE_LABEL}` : ""
-          })`,
+          title: lensTitle(
+            `${keep} (${summarizeHunk(hunk)}${
+              hunk.degraded ? `, ${WHOLE_FILE_LABEL}` : ""
+            })`,
+            "first"
+          ),
           command: "claudeKeepUndo.keepHunk",
           // The fingerprint travels with the command so an action fired against
           // a lens VS Code has not re-rendered yet is refused, not misapplied.
           arguments: [absPath, index, hunk.fingerprint],
         }),
         new vscode.CodeLens(range, {
-          title: undo,
+          title: lensTitle(undo),
           command: "claudeKeepUndo.undoHunk",
           arguments: [absPath, index, hunk.fingerprint],
         })
       );
+      if (index === currentIndex) {
+        const total = tracked.hunks.length;
+        lenses.push(
+          new vscode.CodeLens(range, {
+            title: lensTitle(prev),
+            command: "claudeKeepUndo.gotoHunk",
+            arguments: [absPath, neighborHunkIndex(tracked.hunks, index, -1)],
+          }),
+          new vscode.CodeLens(range, {
+            title: lensTitle(`${index + 1} of ${total}`),
+            tooltip: `Claude change ${index + 1} of ${total}`,
+            // Empty command: VS Code still shows the title, but as plain text
+            // rather than a link. Jumping here would be a no-op — these extras
+            // only render on the hunk the caret is already in.
+            command: "",
+          }),
+          new vscode.CodeLens(range, {
+            title: lensTitle(next),
+            command: "claudeKeepUndo.gotoHunk",
+            arguments: [absPath, neighborHunkIndex(tracked.hunks, index, 1)],
+          })
+        );
+      }
     });
 
     return lenses;
+  }
+
+  /**
+   * Hunk under the caret in the active editor for this document. Undefined when
+   * this file is not focused — extras would otherwise pin to a stale hunk.
+   */
+  private currentHunkFor(document: vscode.TextDocument): number | undefined {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.document.uri.toString() !== document.uri.toString()) {
+      return undefined;
+    }
+    const tracked = this.store.get(document.uri.fsPath);
+    if (!tracked || tracked.hunks.length === 0) {
+      return undefined;
+    }
+    return currentHunkIndex(tracked.hunks, editor.selection.active.line);
   }
 
   dispose(): void {
@@ -116,6 +187,17 @@ export class ClaudeCodeLensProvider
     }
     this._onDidChange.dispose();
   }
+}
+
+/**
+ * VS Code draws `\u00a0|\u00a0` between items and runs `title.trim()`, so real
+ * spaces never show. One U+2800 braille blank on each side of the pipe (right
+ * pad on every title, left pad on every title but the first) keeps the pipe
+ * visually centered. The first item has no left pad so Keep sits flush.
+ */
+function lensTitle(text: string, position: "first" | "rest" = "rest"): string {
+  const gap = "\u2800";
+  return `${position === "first" ? "" : gap}${text}${gap}`;
 }
 
 /**
