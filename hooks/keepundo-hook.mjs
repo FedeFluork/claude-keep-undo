@@ -126,7 +126,7 @@ function loadHookPeers(stateDir, selfRoot) {
         continue;
       }
       const filePath = path.join(dir, name);
-      const folders = readPeersFile(filePath, true);
+      const folders = readPeersFile(filePath, true, stateDir);
       if (folders.length > 0) {
         lists.push(folders);
       }
@@ -140,11 +140,52 @@ function loadHookPeers(stateDir, selfRoot) {
   if (sawDir) {
     return fallback;
   }
-  const combined = readPeersFile(path.join(stateDir, "peers.json"), false);
+  // Same freshness rule as a per-window file: a `peers.json` with no live
+  // `peers.d` beside it is a leftover, and a leftover must not keep a capture
+  // scope alive indefinitely.
+  const combined = readPeersFile(
+    path.join(stateDir, "peers.json"),
+    true,
+    stateDir
+  );
   return combined.length > 0 ? combined : fallback;
 }
 
-function readPeersFile(filePath, requireFresh) {
+/**
+ * Is this a state directory this extension could have created?
+ *
+ * The peer list is data, and it decides where the hook copies verbatim content
+ * of the user's files and which ignore rules it reads. Every live folder store
+ * is `<globalStorage>/folders/<pathKey>`, so a peer's state directory has to be
+ * a sibling of ours with a `pathKey`-shaped name. A malformed or stale entry
+ * then cannot redirect a copy somewhere nobody is looking.
+ *
+ * `--state` comes from the hook registration in `settings.json`, not from the
+ * payload, which is what makes it the trustworthy half of the comparison.
+ */
+function plausibleStateDir(ownStateDir, candidate) {
+  if (typeof candidate !== "string" || candidate === "") {
+    return false;
+  }
+  const own = path.resolve(ownStateDir);
+  const dir = path.resolve(candidate);
+  const fold = (p) => (process.platform === "linux" ? p : p.toLowerCase());
+  if (fold(path.dirname(dir)) !== fold(path.dirname(own))) {
+    return false;
+  }
+  return /^[0-9a-f]{16}$/.test(path.basename(dir));
+}
+
+/** A peer root has to be a directory that exists; nothing else is reviewable. */
+function plausibleRoot(root) {
+  try {
+    return typeof root === "string" && fs.statSync(root).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function readPeersFile(filePath, requireFresh, ownStateDir) {
   let raw;
   try {
     raw = fs.readFileSync(filePath, "utf8");
@@ -163,8 +204,9 @@ function readPeersFile(filePath, requireFresh) {
     for (const item of parsed.folders) {
       if (
         item &&
-        typeof item.root === "string" &&
-        typeof item.stateDir === "string"
+        plausibleRoot(item.root) &&
+        (item.stateDir === ownStateDir ||
+          plausibleStateDir(ownStateDir, item.stateDir))
       ) {
         const folder = { root: item.root, stateDir: item.stateDir };
         if (item.bash === false) {
@@ -578,19 +620,20 @@ function workspacePath(ctx, abs) {
   }
   const rel = relativeInside(ctx.root, abs);
   if (rel !== undefined) {
-    return rel === "" ? undefined : path.join(ctx.root, rel);
+    return path.join(ctx.root, rel);
   }
   if (ctx.rootReal) {
     const relReal = relativeInside(ctx.rootReal, abs);
     if (relReal !== undefined) {
-      return relReal === "" ? undefined : path.join(ctx.root, relReal);
+      return path.join(ctx.root, relReal);
     }
   }
   return undefined;
 }
 
 /**
- * Relative path of `abs` under `root`, or undefined when it is not inside.
+ * Relative path of `abs` under `root`, or undefined when it is not a path
+ * strictly inside it — including when it *is* the root under another spelling.
  * Prefers `path.relative` so the file-name case is kept; falls back to a
  * case-folded relative on Windows/macOS when the two spellings disagree.
  */
@@ -600,7 +643,7 @@ function relativeInside(root, abs) {
   }
   const rel = path.relative(root, abs);
   if (rel === "") {
-    return "";
+    return undefined; // `isInside` already excludes the root itself
   }
   if (
     !path.isAbsolute(rel) &&
@@ -620,7 +663,9 @@ function relativeInside(root, abs) {
     folded === ".." ||
     folded.startsWith(`..${path.sep}`)
   ) {
-    return "";
+    // `isInside` already said yes, so this is the root spelled differently.
+    // Not a path *under* the root, which is what this function reports.
+    return undefined;
   }
   return folded;
 }
@@ -1102,12 +1147,11 @@ async function main() {
   const input = payload.tool_input || {};
   const root = flag("--root");
   const bashMode = flag("--bash") || "off";
-  const eventsPath = path.join(stateDir, "events.ndjson");
 
   /** One diagnostic line about some path, with an optional reason. */
-  const note = (forPath, skipped, extra) =>
+  const noteInto = (dir) => (forPath, skipped, extra) =>
     appendEvent(
-      eventsPath,
+      path.join(dir, "events.ndjson"),
       JSON.stringify({
         phase: mode,
         path: forPath,
@@ -1117,6 +1161,7 @@ async function main() {
         ...(extra || {}),
       }) + "\n"
     );
+  const note = noteInto(stateDir);
 
   // Files the user excluded are not read, not staged and not promoted. This is
   // the only place that can make that promise: by the time the extension sees a
@@ -1155,7 +1200,10 @@ async function main() {
         bash: bashMode,
         skipBash: folder.bash === false,
         ignore: loadIgnoreRules(folder.stateDir, folder.root),
-        note,
+        // Into *this* folder's log, not the session folder's. The baselines
+        // land in the owning folder's store; an event about them filed
+        // somewhere else is a diagnostic nobody will find.
+        note: noteInto(folder.stateDir),
       };
       if (mode === "pre") {
         bashPre(payload, input, ctx);
@@ -1195,7 +1243,9 @@ async function main() {
   const key = pathKey(filePath);
   const baselineFile = path.join(captureState, "baselines", key);
   const pendingFile = path.join(captureState, "pending", key);
-  const record = (skipped) => note(filePath, skipped);
+  // Into the log of the folder the capture lands in, for the same reason the
+  // baseline goes there: the two halves of one record belong together.
+  const record = (skipped) => noteInto(captureState)(filePath, skipped);
 
   if (
     captureIgnore.status === "ok" &&
