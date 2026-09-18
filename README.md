@@ -12,8 +12,9 @@
 
 <div align="center">
   <a href="https://marketplace.visualstudio.com/items?itemName=FedeFluork.claude-keep-undo"><img src="https://badgen.net/vs-marketplace/v/FedeFluork.claude-keep-undo?label=marketplace&color=blue" alt="Marketplace"></a>
-  <a href="https://marketplace.visualstudio.com/items?itemName=FedeFluork.claude-keep-undo"><img src="https://badgen.net/vs-marketplace/i/FedeFluork.claude-keep-undo?label=installs&color=blue" alt="Installs"></a>
+  <a href="https://marketplace.visualstudio.com/items?itemName=FedeFluork.claude-keep-undo"><img src="https://badgen.net/vs-marketplace/i/FedeFluork.claude-keep-undo?label=marketplace%20installs&color=blue" alt="Marketplace installs"></a>
   <a href="https://open-vsx.org/extension/FedeFluork/claude-keep-undo"><img src="https://img.shields.io/open-vsx/v/FedeFluork/claude-keep-undo?label=open%20vsx" alt="Open VSX"></a>
+  <a href="https://open-vsx.org/extension/FedeFluork/claude-keep-undo"><img src="https://img.shields.io/open-vsx/dt/FedeFluork/claude-keep-undo?label=open%20vsx%20installs&color=blue" alt="Open VSX installs"></a>
 </div>
 <div align="center">
   <a href="https://code.visualstudio.com/"><img src="https://img.shields.io/badge/VS%20Code-%5E1.90.0-blue" alt="VS Code"></a>
