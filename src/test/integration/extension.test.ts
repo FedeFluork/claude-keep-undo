@@ -22,6 +22,22 @@ function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Poll until a condition holds, rather than sleeping a guessed interval. */
+async function until(
+  what: string,
+  predicate: () => boolean,
+  timeout = 5_000
+): Promise<void> {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (predicate()) {
+      return;
+    }
+    await wait(50);
+  }
+  assert.fail(`timed out waiting for ${what}`);
+}
+
 describe("Keep / Undo for Claude Code", () => {
   let root: string;
   let stateDir: string;
@@ -482,10 +498,12 @@ describe("Keep / Undo for Claude Code", () => {
     }
   });
 
-  it("does not delete an out-of-workspace baseline on refresh", async () => {
-    // Folder-keyed state is shared across windows. A window that does not own
-    // this path (different folders, or trackOutsideWorkspace off) must hide it,
-    // not wipe the only pre-Claude copy.
+  it("drops an out-of-scope baseline no other window is holding", async () => {
+    // Folder-keyed state is shared across windows, so a copy another window is
+    // reviewing must survive a refresh here — that is what the peer
+    // registrations are consulted for. With no such window there is nobody to
+    // protect, and the copy is a verbatim one of a file this window is not
+    // reviewing: it goes, as it did before folder-keyed state.
     const outside = path.join(
       os.tmpdir(),
       `keepundo-foreign-${Date.now()}.txt`
@@ -494,14 +512,12 @@ describe("Keep / Undo for Claude Code", () => {
     const content = seedBaseline(outside, "before\n");
     try {
       await vscode.commands.executeCommand("claudeKeepUndo.refresh");
-      await wait(200);
-      assert.equal(api.store.isTracked(outside), false);
-      assert.equal(
-        fileExists(content),
-        true,
-        "another window may still own this review"
+      await until(
+        "the out-of-scope copy to be dropped",
+        () => !fileExists(content)
       );
-      assert.equal(fileExists(sidecarPath(content)), true);
+      assert.equal(api.store.isTracked(outside), false);
+      assert.equal(fileExists(sidecarPath(content)), false);
     } finally {
       fs.rmSync(outside, { force: true });
       fs.rmSync(content, { force: true });
@@ -947,21 +963,6 @@ describe("Keep / Undo for Claude Code", () => {
 
   describe("ignored files", () => {
     /** Poll until a condition holds, so a watcher's latency is not a flake. */
-    async function until(
-      what: string,
-      predicate: () => boolean,
-      timeout = 5_000
-    ): Promise<void> {
-      const deadline = Date.now() + timeout;
-      while (Date.now() < deadline) {
-        if (predicate()) {
-          return;
-        }
-        await wait(50);
-      }
-      assert.fail(`timed out waiting for ${what}`);
-    }
-
     const ignoreFile = () => path.join(root, ".keepundoignore");
 
     afterEach(async () => {
@@ -985,9 +986,12 @@ describe("Keep / Undo for Claude Code", () => {
       );
     });
 
-    it("hides a baseline that a rule reaches after it was written", async () => {
+    it("drops a baseline that a rule reaches after it was written", async () => {
       // The hook may have captured the file before the rule existed, or with an
-      // older descriptor. The sweep is what takes it out of this window's queue.
+      // older descriptor. The sweep is what takes it out of the queue — and,
+      // when no other window is reviewing that copy, off the disk. Leaving it
+      // would break the one promise `.keepundoignore` makes about a `.env`:
+      // that no copy of its content is in the extension's storage.
       const file = makeFile("it-generated.ts", "export const a = 2;\n");
       seedBaseline(file, "export const a = 1;\n");
       await vscode.commands.executeCommand("claudeKeepUndo.refresh");
@@ -1001,10 +1005,9 @@ describe("Keep / Undo for Claude Code", () => {
         "the file to leave the queue",
         () => !api.store.isTracked(file)
       );
-      assert.equal(
-        fileExists(path.join(baselinesDir(stateDir), pathKey(file))),
-        true,
-        "its recorded original stays on disk for another window, or if the rule is removed"
+      await until(
+        "its recorded original to be dropped",
+        () => !fileExists(path.join(baselinesDir(stateDir), pathKey(file)))
       );
     });
 

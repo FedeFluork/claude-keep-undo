@@ -322,13 +322,21 @@ export function readHookPeerRegistrations(
  * a crashed window's capture scope alive.
  */
 export function listHookPeerRegistrationLists(
-  stateDir: string
+  stateDir: string,
+  exceptWindowId?: string
 ): HookPeerFolder[][] {
   const lists: HookPeerFolder[][] = [];
   const dir = path.join(stateDir, HOOK_PEERS_DIR);
+  const own =
+    exceptWindowId === undefined
+      ? undefined
+      : path.basename(hookPeersWindowFile(stateDir, exceptWindowId));
   for (const name of listDir(dir)) {
     if (!name.endsWith(".json") || name.endsWith(".tmp")) {
       continue;
+    }
+    if (own !== undefined && name === own) {
+      continue; // our own registration is not another window
     }
     const filePath = path.join(dir, name);
     const raw = readFileSafe(filePath);
@@ -382,15 +390,25 @@ function hookPeerRegistrationTime(
  * (or, if `destRoot` is omitted, still has `selfRoot` at all). Opening a nested
  * layout in this window must not move files another window still treats as
  * belonging here.
+ *
+ * Pass `exceptWindowId` — `vscode.env.sessionId` — to mean *another* window,
+ * which is what the name says. Without it this window's own registration
+ * answers the question, so a lone window is told that somebody else holds the
+ * folder. That is harmless where a `destRoot` is given (our own registration
+ * lists both roots, so it is skipped anyway) and wrong where it is not.
  */
 export function otherWindowHoldsFolder(
   sourceStateDir: string,
   selfRoot: string,
-  destRoot?: string
+  destRoot?: string,
+  exceptWindowId?: string
 ): boolean {
   const self = normalizePath(selfRoot);
   const dest = destRoot === undefined ? undefined : normalizePath(destRoot);
-  for (const list of listHookPeerRegistrationLists(sourceStateDir)) {
+  for (const list of listHookPeerRegistrationLists(
+    sourceStateDir,
+    exceptWindowId
+  )) {
     const roots = new Set(list.map((folder) => normalizePath(folder.root)));
     if (!roots.has(self)) {
       continue;
@@ -591,12 +609,39 @@ export function moveFile(from: string, to: string): boolean {
 }
 
 export type RelocateResult =
-  "moved" | "kept-destination" | "missing" | "failed";
+  "moved" | "kept-destination" | "replaced-destination" | "missing" | "failed";
+
+/** Are two state files byte-identical? Unreadable counts as "not known to be". */
+function sameBytes(a: string, b: string): boolean {
+  try {
+    return Buffer.compare(fs.readFileSync(a), fs.readFileSync(b)) === 0;
+  } catch {
+    return false;
+  }
+}
+
+/** When this pair was recorded, or `undefined` when the descriptor is unusable. */
+function statePairTime(contentPath: string): number | undefined {
+  const sidecar = readSidecar(contentPath);
+  return sidecar && typeof sidecar.ts === "number" ? sidecar.ts : undefined;
+}
 
 /**
  * Move a baseline/pending content+sidecar pair into another folder's matching
- * directory. If that directory already has this `pathKey`, keep the destination
- * copy and drop the source — two queues must not hold the same file.
+ * directory. Two queues must not hold the same file, so when that directory
+ * already has this `pathKey` one of the two copies is dropped.
+ *
+ * Which one is not arbitrary. The two can hold *different* content — an outer
+ * window and a nested one photograph the same file at different moments — and a
+ * baseline's job is to be the state before Claude touched the file, so the
+ * older recording wins. Identical content is a true duplicate and the
+ * destination is kept, which costs nothing.
+ *
+ * The moves are ordered so that no failure can leave a content file behind
+ * without a descriptor: the sidecar is *copied* first, the content moved
+ * second, the source sidecar removed last. An orphan `.json` is skipped by
+ * every sweep; an orphan content file is a verbatim copy of the user's source
+ * that nothing would ever look at again.
  */
 export function relocateStatePair(
   contentPath: string,
@@ -605,7 +650,13 @@ export function relocateStatePair(
   if (!fileExists(contentPath)) {
     return "missing";
   }
-  ensureDir(destDir);
+  try {
+    ensureDir(destDir);
+  } catch {
+    // Called from a sweep over every pair in a directory: throwing here would
+    // abandon the rest of the pass, not just this file.
+    return "failed";
+  }
   const dest = path.join(destDir, path.basename(contentPath));
   if (normalizePath(contentPath) === normalizePath(dest)) {
     return "moved";
@@ -613,18 +664,56 @@ export function relocateStatePair(
   const srcSidecar = sidecarPath(contentPath);
   const destSidecar = sidecarPath(dest);
   if (fileExists(dest)) {
-    removeFile(contentPath);
-    removeFile(srcSidecar);
-    return "kept-destination";
+    const srcTime = statePairTime(contentPath);
+    const destTime = statePairTime(dest);
+    const sourceIsOlder =
+      srcTime !== undefined && (destTime === undefined || srcTime < destTime);
+    if (sameBytes(contentPath, dest) || !sourceIsOlder) {
+      removeFile(contentPath);
+      removeFile(srcSidecar);
+      return "kept-destination";
+    }
+    // The source is the earlier recording of a file whose two copies disagree.
+    // Overwrite rather than drop: keeping the later one would make an Undo
+    // restore content the file never held before Claude ran.
+    if (!writePairInOrder(contentPath, srcSidecar, dest, destSidecar)) {
+      return "failed";
+    }
+    return "replaced-destination";
   }
-  if (!moveFile(contentPath, dest)) {
-    return "failed";
-  }
-  if (fileExists(srcSidecar) && !moveFile(srcSidecar, destSidecar)) {
-    moveFile(dest, contentPath);
+  if (!writePairInOrder(contentPath, srcSidecar, dest, destSidecar)) {
     return "failed";
   }
   return "moved";
+}
+
+/**
+ * Put a content+sidecar pair at `dest`, leaving nothing half-written behind.
+ * See {@link relocateStatePair} for why the order is what it is.
+ */
+function writePairInOrder(
+  contentPath: string,
+  srcSidecar: string,
+  dest: string,
+  destSidecar: string
+): boolean {
+  const hadSidecar = fileExists(srcSidecar);
+  if (hadSidecar) {
+    try {
+      ensureDir(path.dirname(destSidecar));
+      fs.copyFileSync(srcSidecar, destSidecar);
+    } catch {
+      return false; // nothing has moved yet
+    }
+  }
+  if (!moveFile(contentPath, dest)) {
+    if (hadSidecar) {
+      removeFile(destSidecar); // a stray .json is harmless; leaving it is not tidy
+    }
+    return false;
+  }
+  removeFile(srcSidecar);
+  return true;
 }
 
 /**
@@ -687,18 +776,31 @@ export function rehomeDisplacedPairs(
         ? baselinesDir(owner.stateDir)
         : pendingDir(owner.stateDir);
     const result = relocateStatePair(contentPath, destDir);
-    if (result === "moved" || result === "kept-destination") {
+    if (result !== "failed" && result !== "missing") {
       n++;
-      log?.(
-        result === "moved"
-          ? `moved ${kind} for ${sidecar.path} into ${owner.root}`
-          : `dropped duplicate ${kind} for ${sidecar.path}; ${owner.root} already has it`
-      );
+      log?.(relocationMessage(result, kind, sidecar.path, owner.root));
     } else if (result === "failed") {
       log?.(`could not move ${kind} for ${sidecar.path} into ${owner.root}`);
     }
   }
   return n;
+}
+
+/** What happened to a relocated pair, in words, for the diagnostic log. */
+export function relocationMessage(
+  result: RelocateResult,
+  kind: "baselines" | "pending",
+  absPath: string,
+  destRoot: string
+): string {
+  switch (result) {
+    case "kept-destination":
+      return `dropped this folder's ${kind} for ${absPath}; ${destRoot} already has an equal or earlier copy`;
+    case "replaced-destination":
+      return `moved ${kind} for ${absPath} into ${destRoot}, replacing a later copy recorded there`;
+    default:
+      return `moved ${kind} for ${absPath} into ${destRoot}`;
+  }
 }
 
 /** Per-folder review state, keyed by the folder path so it follows the repo. */

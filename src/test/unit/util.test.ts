@@ -329,6 +329,25 @@ describe("PathMap / PathSet", () => {
     set.delete(alt);
     assert.equal(set.has(file), false);
   });
+
+  it("hands back the folded key, not the spelling it was given", () => {
+    // The point of this test is that a PathMap key is not presentable. Anything
+    // the UI shows has to come from the stored value — `getUnreviewable()` read
+    // the key once, and every `not reviewable` row on macOS and Windows was
+    // lowercased as a result.
+    const file = path.join(tmp, "Mixed_Case_Name.TXT");
+    if (normalizePath(file) === file) {
+      return; // Linux does not fold, so there is nothing to observe
+    }
+    const map = new PathMap<string>();
+    map.set(file, "v");
+    assert.deepEqual([...map.keys()], [normalizePath(file)]);
+    assert.notDeepEqual([...map.keys()], [file]);
+
+    const set = new PathSet();
+    set.add(file);
+    assert.deepEqual([...set.values()], [normalizePath(file)]);
+  });
 });
 
 describe("isInsideRoot", () => {
@@ -527,18 +546,90 @@ describe("relocateStatePair", () => {
     assert.equal(fs.existsSync(sidecarPath(content)), false);
   });
 
-  it("keeps the destination copy when the same key is already there", () => {
-    const srcDir = path.join(tmp, "relocate-dup-src");
-    const destDir = path.join(tmp, "relocate-dup-dest");
+  /** Seed a source and a destination copy of one key, with their timestamps. */
+  function seedPair(
+    name: string,
+    src: { text: string; ts: number },
+    dst: { text: string; ts: number }
+  ): { content: string; destDir: string; dest: string } {
+    const srcDir = path.join(tmp, `${name}-src`);
+    const destDir = path.join(tmp, `${name}-dest`);
     const content = path.join(srcDir, "dupkey");
     const dest = path.join(destDir, "dupkey");
-    atomicWrite(content, "source\n");
-    atomicWrite(sidecarPath(content), JSON.stringify({ path: "/y.ts", ts: 1 }));
-    atomicWrite(dest, "destination\n");
-    atomicWrite(sidecarPath(dest), JSON.stringify({ path: "/y.ts", ts: 2 }));
+    atomicWrite(content, src.text);
+    atomicWrite(
+      sidecarPath(content),
+      JSON.stringify({ path: "/y.ts", ts: src.ts })
+    );
+    atomicWrite(dest, dst.text);
+    atomicWrite(
+      sidecarPath(dest),
+      JSON.stringify({ path: "/y.ts", ts: dst.ts })
+    );
+    return { content, destDir, dest };
+  }
+
+  it("keeps the destination copy when the two are identical", () => {
+    const { content, destDir, dest } = seedPair(
+      "relocate-same-bytes",
+      { text: "same\n", ts: 1 },
+      { text: "same\n", ts: 2 }
+    );
     assert.equal(relocateStatePair(content, destDir), "kept-destination");
-    assert.equal(fs.readFileSync(dest, "utf8"), "destination\n");
+    assert.equal(fs.readFileSync(dest, "utf8"), "same\n");
     assert.equal(fs.existsSync(content), false);
+    assert.equal(fs.existsSync(sidecarPath(content)), false);
+  });
+
+  it("prefers the earlier recording when the two disagree", () => {
+    // An outer window and a nested one can photograph the same file at
+    // different moments. A baseline is the state *before* Claude touched the
+    // file, so taking the later copy would make Undo restore content the file
+    // never held.
+    const { content, destDir, dest } = seedPair(
+      "relocate-older-src",
+      { text: "before\n", ts: 1 },
+      { text: "after\n", ts: 2 }
+    );
+    assert.equal(relocateStatePair(content, destDir), "replaced-destination");
+    assert.equal(fs.readFileSync(dest, "utf8"), "before\n");
+    assert.equal(readSidecar(dest)?.ts, 1);
+    assert.equal(fs.existsSync(content), false);
+    assert.equal(fs.existsSync(sidecarPath(content)), false);
+  });
+
+  it("keeps the destination when it is the earlier recording", () => {
+    const { content, destDir, dest } = seedPair(
+      "relocate-older-dest",
+      { text: "after\n", ts: 2 },
+      { text: "before\n", ts: 1 }
+    );
+    assert.equal(relocateStatePair(content, destDir), "kept-destination");
+    assert.equal(fs.readFileSync(dest, "utf8"), "before\n");
+    assert.equal(fs.existsSync(content), false);
+  });
+
+  it("leaves no content file behind when the move cannot complete", () => {
+    // Ordering matters more than the failure itself: a stray `.json` is skipped
+    // by every sweep, a stray content file is a verbatim copy of the user's
+    // source that nothing would ever look at again.
+    const srcDir = path.join(tmp, "relocate-blocked-src");
+    const content = path.join(srcDir, "blockedkey");
+    atomicWrite(content, "original\n");
+    atomicWrite(sidecarPath(content), JSON.stringify({ path: "/b.ts", ts: 1 }));
+    // A file where the destination directory would have to be.
+    const blocker = path.join(tmp, "relocate-blocker");
+    atomicWrite(blocker, "x");
+    assert.equal(
+      relocateStatePair(content, path.join(blocker, "nested")),
+      "failed"
+    );
+    assert.equal(
+      fs.readFileSync(content, "utf8"),
+      "original\n",
+      "a failed relocation has to stay retryable"
+    );
+    assert.equal(fs.existsSync(sidecarPath(content)), true);
   });
 
   it("does not delete the file when it is already in the destination", () => {

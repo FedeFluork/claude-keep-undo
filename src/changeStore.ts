@@ -181,6 +181,19 @@ const SNAPSHOT_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 const SNAPSHOT_MAX = 200;
 
 /**
+ * How long a baseline this folder is not listing may stay on disk.
+ *
+ * Multi-root review must not let one window's ignore rules delete the only
+ * pre-Claude original another window is reviewing, so such a baseline is hidden
+ * rather than dropped. But it is still a verbatim copy of the user's source,
+ * and `.keepundoignore` promises there is no copy of an excluded file in
+ * storage — a promise with no expiry date is not one. Same TTL as a recovery
+ * snapshot: a review nobody has touched in two weeks is not pending, it is
+ * abandoned.
+ */
+const HIDDEN_BASELINE_TTL_MS = SNAPSHOT_TTL_MS;
+
+/**
  * Above this size an Undo writes straight to disk instead of opening the
  * document first. Routing through a `WorkspaceEdit` is what puts Undo on the
  * editor's undo stack, but opening a multi-megabyte file that nobody had open
@@ -286,7 +299,7 @@ export interface ReviewStore {
 export class ChangeStore implements vscode.Disposable, ReviewStore {
   private tracked = new PathMap<TrackedFile>();
   private userTouched = new PathSet();
-  private unreviewable = new PathMap<string>();
+  private unreviewable = new PathMap<Unreviewable>();
   /** Paths whose baseline records that Claude created the file. */
   private createdFiles = new PathSet();
   private applying = 0;
@@ -348,6 +361,9 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
       this.sweepPendingState();
       this.sweepBashState();
       this.pruneSnapshots();
+      // Hidden baselines expire too. Without this pass a copy kept for another
+      // window would outlive that window's interest in it by any margin.
+      this.sweepHiddenBaselines();
     }, HOUSEKEEPING_MS);
     // Node keeps the process alive for a pending interval; ours must not hold
     // the extension host open.
@@ -491,7 +507,7 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
     ];
     for (const { src, destDir } of pairs) {
       const result = relocateStatePair(src, destDir);
-      if (result === "moved" || result === "kept-destination") {
+      if (result !== "missing" && result !== "failed") {
         any = true;
       }
     }
@@ -600,9 +616,11 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
    * simply missed the edit.
    */
   getUnreviewable(): Unreviewable[] {
-    return [...this.unreviewable.entries()]
-      .map(([p, reason]) => ({ path: p, reason }))
-      .sort((a, b) => a.path.localeCompare(b.path));
+    // `.values()`, never `.keys()`: a PathMap key is case-folded on macOS and
+    // Windows, and this list goes straight into the changes view.
+    return [...this.unreviewable.values()].sort((a, b) =>
+      a.path.localeCompare(b.path)
+    );
   }
 
   noteUnreviewable(absPath: string, reason: string): void {
@@ -611,10 +629,10 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
       // someone who excluded it asked not to be told about it at all.
       return;
     }
-    if (this.unreviewable.get(absPath) === reason) {
+    if (this.unreviewable.get(absPath)?.reason === reason) {
       return;
     }
-    this.unreviewable.set(absPath, reason);
+    this.unreviewable.set(absPath, { path: absPath, reason });
     this.fire(undefined);
   }
 
@@ -927,16 +945,75 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
       }
       if (!this.isInScope(sidecar.path)) {
         // Another window's folders or `trackOutsideWorkspace` — or a nested
-        // folder that now owns this path, if rehome has not run yet. Hide it
-        // here; do not delete it. The copy is the only pre-Claude original.
+        // folder that now owns this path, if rehome has not run yet.
+        this.dropOrHideBaseline(contentPath, sidecar, allowDelete, "scope");
         continue;
       }
       if (this.isIgnored(sidecar.path)) {
-        // This window asked not to show the file. Another window — or this one
-        // after the rule is removed — may still need the recorded original.
+        // This window asked not to show the file.
+        this.dropOrHideBaseline(contentPath, sidecar, allowDelete, "ignored");
         continue;
       }
       inScope.add(sidecar.path);
+    }
+  }
+
+  /**
+   * A baseline this folder will not list: delete it, or leave it for the window
+   * that still needs it.
+   *
+   * The reason to keep it is precise and it expires. Another *registered*
+   * window having this folder open is the only thing that makes the copy
+   * somebody else's; with no such window there is nobody to protect, and 1.2's
+   * behaviour — the copy goes — is the correct one. That is the common case:
+   * one window, a rule added to `.keepundoignore`, and the verbatim copy of the
+   * excluded file must not survive it.
+   *
+   * When another window does hold the folder the copy stays, but not forever:
+   * past {@link HIDDEN_BASELINE_TTL_MS} it is swept anyway. A foreign store is
+   * never written to from here.
+   */
+  private dropOrHideBaseline(
+    contentPath: string,
+    sidecar: { path: string; ts?: number },
+    allowDelete: boolean,
+    why: "scope" | "ignored"
+  ): void {
+    const absPath = sidecar.path;
+    if (!allowDelete) {
+      return; // a related store's directory: not ours to prune
+    }
+    if (why === "scope" && owningPeer(this.ownershipCandidates(), absPath)) {
+      // A folder in *this* window owns it. `rehomePath` hands the copy over;
+      // deleting here would destroy it on the way.
+      return;
+    }
+    const label =
+      why === "ignored" ? "ignored baseline" : "out-of-scope baseline";
+    if (
+      !otherWindowHoldsFolder(
+        this.stateDir,
+        this.workspaceRoot,
+        undefined,
+        vscode.env.sessionId
+      )
+    ) {
+      this.log(`dropping ${label} for ${absPath}`);
+      this.markStateWrite();
+      removeFile(contentPath);
+      removeFile(sidecarPath(contentPath));
+      return;
+    }
+    const age = Date.now() - (sidecar.ts ?? 0);
+    if (age > HIDDEN_BASELINE_TTL_MS) {
+      this.log(
+        `dropping ${label} for ${absPath}: hidden for more than ${Math.round(
+          HIDDEN_BASELINE_TTL_MS / 86_400_000
+        )} days`
+      );
+      this.markStateWrite();
+      removeFile(contentPath);
+      removeFile(sidecarPath(contentPath));
     }
   }
 
@@ -1076,6 +1153,32 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
       `refusing to ${reason} ${absPath}: the recovery snapshot could not be written`
     );
     return false;
+  }
+
+  /**
+   * Expire baselines this folder is hiding for another window.
+   *
+   * `collectBaselines` already drops the ones nobody is protecting, but it only
+   * runs on a refresh. A window left open for a fortnight would otherwise keep
+   * a verbatim copy of an excluded file indefinitely.
+   */
+  private sweepHiddenBaselines(): void {
+    const dir = baselinesDir(this.stateDir);
+    for (const name of listDir(dir)) {
+      if (name.endsWith(".json") || name.endsWith(".tmp")) {
+        continue;
+      }
+      const contentPath = path.join(dir, name);
+      const sidecar = readSidecar(contentPath);
+      if (!sidecar) {
+        continue; // `collectBaselines` owns the no-descriptor case
+      }
+      if (!this.isInScope(sidecar.path)) {
+        this.dropOrHideBaseline(contentPath, sidecar, true, "scope");
+      } else if (this.isIgnored(sidecar.path)) {
+        this.dropOrHideBaseline(contentPath, sidecar, true, "ignored");
+      }
+    }
   }
 
   /** Drop snapshots older than the TTL, and cap how many are kept. */
@@ -1641,7 +1744,11 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
    * command that adds a rule confirms first.
    */
   reconcileIgnored(): string[] {
-    const left = [...this.tracked.keys()].filter((p) => this.isIgnored(p));
+    // The paths are named in a notification, so they come from the tracked
+    // values — the map's keys are case-folded (see PathMap).
+    const left = this.getTracked()
+      .map((f) => f.path)
+      .filter((p) => this.isIgnored(p));
     for (const absPath of left) {
       this.log(`${absPath} is now ignored: leaving the review queue`);
       this.hideFromQueue(absPath, true);
@@ -2008,7 +2115,7 @@ export class ChangeStore implements vscode.Disposable, ReviewStore {
 
   /** Undo everything currently pending. */
   async undoAll(): Promise<UndoBatchResult> {
-    return this.undoPaths([...this.tracked.keys()]);
+    return this.undoPaths(this.getTracked().map((f) => f.path));
   }
 
   /**
