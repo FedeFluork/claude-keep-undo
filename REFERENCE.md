@@ -104,8 +104,9 @@ IDE-integrated assistant. This extension adds that step back.
   give the keys back everywhere else.
 - **Per-hunk CodeLens.** `Keep (+3 −1)` / `Undo` above each changed region, plus
   `Keep all` / `Undo all` at the top of the file when there is more than one
-  hunk. The hunk under the caret also gets `⬆️ prev` / `2 of 3` / `⬇️ next` on
-  the same inserted row — inside the diff editor by default, since every row
+  hunk. The hunk under the caret also gets `↑ prev` / `2 of 3` / `↓ next` on
+  the same inserted row, with themed arrow icons (emoji ones under
+  `codeLensStyle: emoji`) — inside the diff editor by default, since every row
   displaces a line of code.
 
 ### Across the whole review queue

@@ -49,14 +49,26 @@ export async function goToChange(
 /**
  * Jump to a specific hunk in a tracked file, staying in whichever editor is
  * already showing it (the ordinary tab or the modified side of a Claude diff).
+ *
+ * `fingerprint` is the identity of the hunk the caller *meant*, captured when
+ * the lens was rendered. Refusing a mismatch is the same rule Keep and Undo
+ * follow: the hunk list can be recomputed between render and click, and landing
+ * on whatever now occupies that index is worse than not moving.
  */
 export function goToHunk(
   store: ChangeStore,
   absPath: string,
-  index: number
+  index: number,
+  fingerprint?: string
 ): void {
   const tracked = store.get(absPath);
   if (!tracked || index < 0 || index >= tracked.hunks.length) {
+    return;
+  }
+  if (
+    fingerprint !== undefined &&
+    tracked.hunks[index].fingerprint !== fingerprint
+  ) {
     return;
   }
   const editor = editorForPath(absPath);

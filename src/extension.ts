@@ -321,11 +321,16 @@ export function activate(
     ),
     vscode.commands.registerCommand(
       "claudeKeepUndo.gotoHunk",
-      (absPath?: unknown, index?: unknown) => {
+      (absPath?: unknown, index?: unknown, fingerprint?: unknown) => {
         if (typeof absPath !== "string" || typeof index !== "number") {
           return;
         }
-        goToHunk(store, absPath, index);
+        goToHunk(
+          store,
+          absPath,
+          index,
+          typeof fingerprint === "string" ? fingerprint : undefined
+        );
       }
     ),
     vscode.commands.registerCommand(
