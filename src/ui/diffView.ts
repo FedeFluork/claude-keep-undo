@@ -99,7 +99,7 @@ export class CurrentContentProvider
     });
   }
 
-  provideTextDocumentContent(_uri: vscode.Uri): string {
+  provideTextDocumentContent(): string {
     return "";
   }
 
