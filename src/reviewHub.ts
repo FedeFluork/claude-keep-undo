@@ -44,6 +44,12 @@ import {
 } from "./util";
 
 /**
+ * Least time between two focus-driven peer publishes. Well inside
+ * `HOOK_PEERS_TTL_MS`, and far above the rate at which a window gains focus.
+ */
+const PEER_PUBLISH_MIN_INTERVAL_MS = 60_000;
+
+/**
  * One workspace folder's review machinery: its own store, ignore rules, hooks,
  * transcript watcher and Source Control entry.
  */
@@ -246,6 +252,7 @@ export class ReviewHub implements vscode.Disposable, ReviewStore {
   private readonly folderListener: vscode.Disposable;
   private readonly windowFocus: vscode.Disposable;
   private heartbeat: NodeJS.Timeout | undefined;
+  private lastPeerPublish = 0;
   private confirmedIgnoreChange = false;
   private disposed = false;
 
@@ -258,13 +265,26 @@ export class ReviewHub implements vscode.Disposable, ReviewStore {
     );
     this.windowFocus = vscode.window.onDidChangeWindowState((state) => {
       if (!this.disposed && state.focused) {
-        this.publishHookPeers();
+        // Debounced: a publish is an atomic write plus a full scan of `peers.d`
+        // per folder, and this fires on every alt-tab. The registration only
+        // has to be rewritten well inside its TTL.
+        this.publishHookPeersSoon();
       }
     });
     this.heartbeat = setInterval(() => {
-      if (!this.disposed) {
-        void this.refreshBashPeers(false);
+      if (this.disposed) {
+        return;
       }
+      // Republish first and unconditionally. A registration expires after
+      // HOOK_PEERS_TTL_MS and is then deleted, and `refreshBashPeers` returns
+      // early when shell-command detection is off — so hanging the heartbeat
+      // off it alone meant that with `detection.bashChanges: "off"` a window
+      // left unfocused for half an hour silently stopped being a peer, and
+      // Edit/Write in a sibling folder stopped being captured. The same
+      // registrations answer `otherWindowHoldsFolder`, so a live window that
+      // expired would also have its originals rehomed out from under it.
+      this.publishHookPeers();
+      void this.refreshBashPeers(false);
     }, HOOK_PEERS_HEARTBEAT_MS);
     this.heartbeat.unref?.();
     this.syncFolders();
@@ -674,8 +694,16 @@ export class ReviewHub implements vscode.Disposable, ReviewStore {
     if (owner) {
       return owner.store;
     }
-    // Outside every folder: the first store that would accept it (trackOutside).
-    return this.getFolders().find((s) => s.store.isInScope(absPath))?.store;
+    // Outside every folder: whichever store would accept it (trackOutside).
+    // Ordered by root path, not by `getFolders()` — that sorts by the folder's
+    // display name, so renaming a folder in the `.code-workspace` would move
+    // the file's queue to a different folder, and two windows listing the same
+    // folders in a different order would disagree about who owns it.
+    return [...this.sessions.values()]
+      .filter((s) => s.store.isInScope(absPath))
+      .sort((a, b) =>
+        normalizePath(a.root).localeCompare(normalizePath(b.root))
+      )[0]?.store;
   }
 
   private fallbackStateDir(): string {
@@ -692,6 +720,7 @@ export class ReviewHub implements vscode.Disposable, ReviewStore {
    * published.
    */
   private publishHookPeers(): void {
+    this.lastPeerPublish = Date.now();
     const folders = this.peerFolderList();
     const text = serializeHookPeerRegistration(folders);
     const windowId = vscode.env.sessionId;
@@ -699,6 +728,20 @@ export class ReviewHub implements vscode.Disposable, ReviewStore {
       atomicWrite(hookPeersWindowFile(session.stateDir, windowId), text);
       this.writeHookPeersUnion(session);
     }
+  }
+
+  /**
+   * Refresh this window's registration, at most once a minute.
+   *
+   * Used for the focus signal, where the point is only that a live window keeps
+   * its registration fresh. `publishHookPeers` itself stays synchronous: a
+   * folder change must be visible to the hook before the next tool call.
+   */
+  private publishHookPeersSoon(): void {
+    if (Date.now() - this.lastPeerPublish < PEER_PUBLISH_MIN_INTERVAL_MS) {
+      return;
+    }
+    this.publishHookPeers();
   }
 
   private withdrawHookPeers(): void {
@@ -763,7 +806,7 @@ export class ReviewHub implements vscode.Disposable, ReviewStore {
     }
     for (const { session, problem } of probes) {
       const skip = problem !== undefined;
-      if (session.skipBashPeer !== skip && !announce) {
+      if (session.skipBashPeer !== skip) {
         this.log(
           skip
             ? `skipping shell-command detection in ${session.name}: ${

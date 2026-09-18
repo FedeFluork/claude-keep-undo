@@ -18,6 +18,14 @@ import {
 
 export type ChangeNode =
   | { type: "folder"; root: string; name: string }
+  /**
+   * The files that belong to no workspace folder, in a multi-root window.
+   * `trackOutsideWorkspace` still reviews Claude's edits to a scratch file or
+   * its own settings; grouping strictly by folder left those counted in the
+   * badge and visible nowhere, which is the one thing this view promises never
+   * to do.
+   */
+  | { type: "outside" }
   | { type: "file"; path: string }
   | { type: "hunk"; path: string; index: number; fingerprint: string }
   | { type: "unreviewable"; path: string };
@@ -56,18 +64,26 @@ export class ChangesViewProvider
     if (!element) {
       const folders = vscode.workspace.workspaceFolders ?? [];
       if (folders.length > 1) {
-        return folders
-          .filter((folder) => this.nodesInFolder(folder.uri.fsPath).length > 0)
+        const all = this.fileNodes();
+        const rows: ChangeNode[] = folders
+          .filter((folder) => this.inFolder(all, folder.uri.fsPath).length > 0)
           .map((folder) => ({
             type: "folder" as const,
             root: folder.uri.fsPath,
             name: folder.name,
           }));
+        if (this.outsideEveryFolder(all).length > 0) {
+          rows.push({ type: "outside" });
+        }
+        return rows;
       }
       return this.fileNodes();
     }
     if (element.type === "folder") {
       return this.nodesInFolder(element.root);
+    }
+    if (element.type === "outside") {
+      return this.outsideEveryFolder(this.fileNodes());
     }
     if (element.type === "file") {
       const hunks = this.store.get(element.path)?.hunks ?? [];
@@ -90,7 +106,7 @@ export class ChangesViewProvider
       (node.type === "file" || node.type === "unreviewable") &&
       (vscode.workspace.workspaceFolders?.length ?? 0) > 1
     ) {
-      return this.folderNodeFor(node.path);
+      return this.folderNodeFor(node.path) ?? { type: "outside" };
     }
     return undefined;
   }
@@ -98,6 +114,9 @@ export class ChangesViewProvider
   getTreeItem(node: ChangeNode): vscode.TreeItem {
     if (node.type === "folder") {
       return this.folderItem(node);
+    }
+    if (node.type === "outside") {
+      return this.outsideItem();
     }
     if (node.type === "unreviewable") {
       return this.unreviewableItem(node);
@@ -122,11 +141,33 @@ export class ChangesViewProvider
   }
 
   private nodesInFolder(root: string): ChangeNode[] {
-    return this.fileNodes().filter((node) => {
+    return this.inFolder(this.fileNodes(), root);
+  }
+
+  /**
+   * Takes the node list rather than rebuilding it: `getChildren` needs one pass
+   * per folder to decide which rows exist, and `folderItem` needs the count
+   * again. Each `fileNodes()` call asks every folder's store for its whole
+   * queue and sorts the result.
+   */
+  private inFolder(nodes: readonly ChangeNode[], root: string): ChangeNode[] {
+    return nodes.filter((node) => {
       if (node.type !== "file" && node.type !== "unreviewable") {
         return false;
       }
       return this.ownedBy(root, node.path);
+    });
+  }
+
+  private outsideEveryFolder(nodes: readonly ChangeNode[]): ChangeNode[] {
+    const roots = (vscode.workspace.workspaceFolders ?? []).map(
+      (folder) => folder.uri.fsPath
+    );
+    return nodes.filter((node) => {
+      if (node.type !== "file" && node.type !== "unreviewable") {
+        return false;
+      }
+      return owningRoot(roots, node.path) === undefined;
     });
   }
 
@@ -155,6 +196,20 @@ export class ChangesViewProvider
     return folder
       ? { type: "folder", root: folder.uri.fsPath, name: folder.name }
       : undefined;
+  }
+
+  private outsideItem(): vscode.TreeItem {
+    const count = this.outsideEveryFolder(this.fileNodes()).length;
+    const item = new vscode.TreeItem(
+      "Outside the workspace",
+      vscode.TreeItemCollapsibleState.Expanded
+    );
+    item.id = "folder:outside";
+    item.iconPath = new vscode.ThemeIcon("file-directory");
+    item.description = String(count);
+    item.tooltip =
+      "Files Claude changed that are under no workspace folder, tracked because claudeKeepUndo.trackOutsideWorkspace is on.";
+    return item;
   }
 
   private folderItem(node: ChangeNode & { type: "folder" }): vscode.TreeItem {

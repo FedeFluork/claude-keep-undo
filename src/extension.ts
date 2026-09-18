@@ -1371,9 +1371,14 @@ function asCommentThread(
   return { path, line };
 }
 
+/**
+ * A tree node that names a file. `Extract` rather than `Exclude`: the view also
+ * has rows that stand for a group (a workspace folder, or everything outside
+ * one), and those carry no path for a command to act on.
+ */
 function isChangeNode(
   arg: unknown
-): arg is Exclude<ChangeNode, { type: "folder" }> {
+): arg is Extract<ChangeNode, { path: string }> {
   return (
     isRecord(arg) &&
     "type" in arg &&
