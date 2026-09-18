@@ -370,25 +370,57 @@ another workspace:
 own sidecar rather than sharing an index file, because the hook process and the
 extension both write here and a shared file would lose updates.
 
-A baseline that this window does not own is **left on disk**, not deleted: another
-window may still be reviewing that file (different folders, or
-`trackOutsideWorkspace` off here and on there). Adding a nested workspace folder
-in the _same_ window moves the recorded original from the outer folder's state
-into the inner one; removing it moves it back. Opening a nested layout in
-_another_ window does not move or delete those copies — merely opening a repo
-must not make Keep/Undo in the first window restore nothing. Each window lists
-reviews that already live in a parent or nested store, filtered by which folder
-owns the file. An explicit Keep or Undo applies to the copy being reviewed,
-including one inherited from a related store, so the decision is visible
-wherever that entry is displayed. Passive browsing still never deletes another
-window's original. Window registrations in `peers.d/` expire if that window
-stops rewriting them, and an empty `peers.d` is "this folder only", not the last
+A baseline this window is not listing is **left on disk only while another open
+window may need it**: a window is a peer while its registration in `peers.d/` is
+fresh, and that is the whole reason to keep the copy. With no such window the
+copy goes, as it did before state became folder-keyed — a verbatim copy of a
+file nobody is reviewing is not recovery data. A copy kept for a peer is swept
+anyway once it has been hidden for 14 days, the same period a recovery snapshot
+is kept: a reason to keep a copy of your source has to have an expiry date.
+
+Adding a nested workspace folder in the _same_ window moves the recorded original
+from the outer folder's state into the inner one; removing it moves it back.
+Opening a nested layout in _another_ window does not move or delete those copies —
+merely opening a repo must not make Keep/Undo in the first window restore
+nothing. Each window lists reviews that already live in a parent or nested store,
+filtered by which folder owns the file. Passive browsing never deletes another
+window's original. An empty `peers.d` is "this folder only", not the last
 combined list.
 
-An ignore rule in this window **hides** an existing review rather than deleting
-it. Workspace-scoped `ignore.patterns` in a browsing `.code-workspace` therefore
-no longer wipe another window's queue; a `.keepundoignore` in the repo is still
-shared, but it also only hides. New captures of ignored files are still refused.
+When two stores hold a copy of the same file and the two disagree, the **earlier**
+recording wins — a baseline's job is to be the state before Claude touched the
+file, so keeping the later one would make an Undo restore content the file never
+held.
+
+An explicit Keep or Undo applies to the copy being reviewed **and to the related
+copies of that same file**, including one in a parent or nested store. This is
+the one place where a decision in one window changes what another window has
+recorded, and it is deliberate: the two windows are showing the same file, so
+resolving it in one and leaving it pending in the other would make Keep look
+like it had not worked. The alternative — folding the change into this window's
+copy only — leaves a stale original behind for the next refresh to rediscover.
+
+### Which folders a Bash call photographs
+
+Claude Code loads hooks from the project the session was started in, so a shell
+command run in repo A would otherwise never notice what it changed in sibling
+repo B. Each window publishes the folders it wants captured into every one of
+those folders' state directories, and the hook photographs the **union** of the
+live registrations it finds beside its own state.
+
+The union is per folder, not per machine: a Bash call in A reads A's
+registrations only, so a window with unrelated repos open is not involved. But
+it does cross windows that share a folder. If one window has A and B open and
+another has A and C, then a shell command in A also runs `git status` in C and
+photographs what is modified there — C is a folder that some open window asked
+to have captured, and the copies land in C's own state directory, not in A's.
+Each folder in the union costs one `git status`, so a window set with many
+folders makes every Bash tool call a little slower.
+
+A folder that is not a Git repository is skipped for shell-command snapshots and
+keeps ordinary Edit/Write detection; a registration entry is ignored altogether
+unless its root exists and its state directory is one this extension could have
+created.
 
 `baselines/` and `snapshots/` hold verbatim copies of your source files —
 including whatever secrets those files contain. Keeping them outside the
@@ -417,6 +449,14 @@ no copy of its content in the extension's storage. The rules are enforced in the
 Claude Code hook as well as in the extension, so the file is never read in the
 first place: by the time a baseline exists, a verbatim copy is already on disk,
 which is too late for a promise about secrets.
+
+Adding a rule for a file that **already** has a recorded original deletes that
+copy, which is what makes the promise above hold for a `.env` you notice in the
+queue rather than before. The one exception is narrow and it expires: when
+another open window still has that folder and may be reviewing the same copy,
+it is left in place, and swept anyway once it has been hidden for 14 days — the
+same period a recovery snapshot is kept. See
+[on-disk state](#on-disk-state).
 
 ### Where the rules come from
 
