@@ -5,7 +5,12 @@ All notable changes to **Keep / Undo for Claude Code** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.0]
+
+Multi-root workspace support and the hunk navigation CodeLens were both
+contributed by [@TobbeLino](https://github.com/TobbeLino), in
+[#2](https://github.com/FedeFluork/claude-keep-undo/pull/2) and
+[#1](https://github.com/FedeFluork/claude-keep-undo/pull/1).
 
 ### Added — multi-root workspaces
 
@@ -19,6 +24,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   empty.
 - **Sibling folders are never treated as “outside the workspace.”** A file in
   the other repo in this window belongs to that repo.
+
+### Added — hunk navigation CodeLens
+
+- **When a file has several hunks**, the hunk under the caret also shows
+  `↑ prev` / `n of N` / `↓ next` on the same CodeLens row as Keep / Undo.
+  Prev and next wrap. The arrows are theme-coloured icons, or emoji under
+  `codeLensStyle: emoji`. The file-level `Claude: N changes` plus Keep all /
+  Undo all at the top of the file is unchanged.
 
 ### Changed
 
@@ -50,6 +63,43 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   disabled `detection.bashChanges` for every folder — is now an information
   toast for that peer only, and **Turn this off** is offered only when no
   folder can run Git.
+- **Pending reviews survive a window that does not own them — while a window
+  that does is still open.** Opening the same folder with different siblings,
+  or with `trackOutsideWorkspace` off, no longer deletes baselines that are out
+  of this window's scope, as long as another open window is registered on that
+  folder; they stay on disk and reappear when a window that owns them loads.
+  With no such window the copy is deleted, as in 1.2 — a verbatim copy of a
+  file nobody is reviewing is not recovery data. A copy kept for another window
+  is swept anyway after 14 days, the period a recovery snapshot is kept.
+  Adding or removing a nested folder in the _same_ window _moves_ the recorded
+  original into the folder that owns the file. Opening a nested layout in
+  _another_ window does not move or delete those originals — a window that
+  merely opens a repo must not make other windows lose Keep/Undo. Nested
+  windows still list reviews that live in a parent store, and outer-only
+  windows still list reviews that live in a nested store. An explicit Keep or
+  Undo applies to the copy being reviewed and to the related copies of that
+  same file, so the decision sticks wherever that entry is shown. Where two
+  stores hold copies that disagree, the earlier recording wins: a baseline is
+  the state before Claude touched the file.
+- **Ignore rules take an existing review out of the queue, and its recorded
+  original with it.** A rule added for a file that already has a baseline
+  deletes that copy — the promise `.keepundoignore` makes about a `.env` is
+  that no copy of its content is in the extension's storage, and a promise with
+  no expiry date is not one. The copy is left in place only while another open
+  window is registered on that folder and may be reviewing it, and swept after
+  14 days even then. New captures are still refused.
+- **A shell command photographs every folder any open window asked for.** The
+  union crosses windows that share a folder: with A and B open in one window
+  and A and C in another, a `git status` also runs in C. Each folder in the
+  union costs one `git status` per Bash tool call, so a large window set makes
+  every shell command a little slower.
+- **Hook peer registrations expire.** A crashed window's folder list is dropped
+  after a short idle interval, and closing the last window rebuilds the hook
+  list from this folder alone rather than restoring the previous combined
+  file.
+
+### Fixed
+
 - **A file Claude created and then deleted leaves the queue.** Shell `rm` never
   opened an editor, so the review list kept a stale row whose click opened
   “file was not found”. Tracked files are recomputed when they disappear on
@@ -57,39 +107,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   dropped. A pre-existing file Claude deleted stays listed as *deleted*; Keep
   forgets it, Undo restores it, and the diff opens against an empty virtual
   document instead of a missing `file:` URI.
-- **Pending reviews survive a window that does not own them.** Opening the same
-  folder with different siblings, or with `trackOutsideWorkspace` off, no longer
-  deletes baselines that are out of this window's scope — they stay on disk and
-  reappear when a window that owns them loads. Adding or removing a nested
-  folder in the _same_ window _moves_ the recorded original into the folder
-  that owns the file. Opening a nested layout in _another_ window does not
-  move or delete those originals — a window that merely opens a repo must not
-  make other windows lose Keep/Undo. Nested windows still list reviews that
-  live in a parent store, and outer-only windows still list reviews that live
-  in a nested store. An explicit Keep or Undo applies to the copy being
-  reviewed, so the decision sticks wherever that entry is shown. Ownership
-  includes the folder itself, so a nested store does not bounce its own files
-  back to the outer one.
-- **Ignore rules hide existing reviews rather than delete them.** A browsing
-  window with different `ignore.patterns` no longer wipes another window's
-  recorded originals. New captures are still refused. Removing the rule can
-  bring the review back.
-- **Hook peer registrations expire.** A crashed window's folder list is dropped
-  after a short idle interval, and closing the last window rebuilds the hook
-  list from this folder alone rather than restoring the previous combined
-  file.
 - **Undo finds a file Git and VS Code spell differently.** On Windows a
   shell-created file was listed in the queue (git's `D:\...`) while Undo from
   the editor looked up `d:\...`, reported nothing to undo, and left the file on
   disk. In-memory review state now folds path case the same way the on-disk
   keys already did.
-
-### Added — hunk navigation CodeLens
-
-- **When a file has several hunks**, the hunk under the caret also shows
-  `⬆️ prev` / `n of N` / `⬇️ next` on the same CodeLens row as Keep / Undo.
-  Prev and next wrap. The file-level `Claude: N changes` plus Keep all /
-  Undo all at the top of the file is unchanged.
 
 ## [1.2.0]
 
